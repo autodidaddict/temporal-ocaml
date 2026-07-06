@@ -1,0 +1,26 @@
+[package]
+name = "temporal_core_bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Produces libtemporal_core_bridge.a — a static archive linked directly into the
+# OCaml runtime (the Octez pattern). We build our OWN thin staticlib because the
+# upstream `temporalio-sdk-core-c-bridge` crate is `cdylib`-only.
+[lib]
+name = "temporal_core_bridge"
+crate-type = ["staticlib"]
+
+# The REAL Temporal core, pulled straight from the upstream git repo and pinned
+# to a rev for reproducibility. This is what makes the build "real": it drags in
+# tokio, tonic, prost, rustls/ring, and the generated protobufs (needs `protoc`).
+[dependencies]
+temporalio-sdk-core = { git = "https://github.com/temporalio/sdk-core", rev = "353fd3b85ea8ce75944deb7af8c7f53d6d2b1d46" }
+temporalio-client   = { git = "https://github.com/temporalio/sdk-core", rev = "353fd3b85ea8ce75944deb7af8c7f53d6d2b1d46" }
+temporalio-common   = { git = "https://github.com/temporalio/sdk-core", rev = "353fd3b85ea8ce75944deb7af8c7f53d6d2b1d46", features = ["core-based-sdk"] }
+prost = "0.14"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+[profile.release]
+opt-level = 2
+lto = false

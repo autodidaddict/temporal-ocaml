@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, ocaml: "5.2" }
+          - { os: macos-14,      ocaml: "5.2" }
+          # Windows uses the mingw (x86_64-pc-windows-gnu) toolchain so the Rust
+          # ABI matches ocaml/setup-ocaml's C compiler.
+          - { os: windows-latest, ocaml: "5.2", rust-target: x86_64-pc-windows-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # protoc is a real system dependency: sdk-core's proto crate runs
+      # tonic-prost-build at compile time.
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "28.x"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      # Cache the (large) sdk-core dependency compile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/temporal_bridge
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ matrix.ocaml }}
+
+      - name: Install OCaml deps
+        run: opam install . --deps-only --yes
+
+      # cargo is decoupled from dune: build+stage the staticlib first.
+      - name: Build Rust bridge
+        shell: bash
+        run: ./scripts/build-bridge.sh
+
+      - name: Build
+        run: opam exec -- dune build examples/ecommerce/main.exe

@@ -1,0 +1,48 @@
+(* Workflows: deterministic orchestration of activities. Each one sequences a few
+   activities via [execute_activity]. Interactions that need SDK primitives we
+   don't have yet are marked "later:". *)
+
+open Temporal
+open Model
+
+let order_workflow =
+  Workflow.define ~name:"OrderWorkflow" (fun ctx (o : order) ->
+      let total = Workflow.execute_activity ctx Activities.validate_order o in
+      let charge =
+        Workflow.execute_activity ctx Activities.charge_payment (o.order_id, total)
+      in
+      (* later: on failure below, compensate with refund_payment (saga) *)
+      let reservation =
+        Workflow.execute_activity ctx Activities.reserve_inventory o.items
+      in
+      (* later: start ShipmentWorkflow as a child instead of an activity *)
+      let shipment =
+        Workflow.execute_activity ctx Activities.request_shipment
+          (o.order_id, o.ship_to)
+      in
+      Printf.sprintf "order %s: charged %s, reserved %s, shipment %s" o.order_id
+        charge reservation shipment)
+
+let shipment_workflow =
+  Workflow.define ~name:"ShipmentWorkflow"
+    (fun ctx ((items, ship_to) : line_item list * string) ->
+      let package = Workflow.execute_activity ctx Activities.pick_and_pack items in
+      let tracking =
+        Workflow.execute_activity ctx Activities.dispatch_carrier (package, ship_to)
+      in
+      (* later: poll delivery on a timer instead of a single confirm *)
+      Workflow.execute_activity ctx Activities.confirm_delivery tracking)
+
+let return_workflow =
+  Workflow.define ~name:"ReturnWorkflow" (fun ctx (r : return_request) ->
+      let rma =
+        Workflow.execute_activity ctx Activities.authorize_return r.return_order
+      in
+      let restocked =
+        Workflow.execute_activity ctx Activities.restock_inventory r.return_items
+      in
+      let refund =
+        Workflow.execute_activity ctx Activities.refund_payment
+          (r.return_charge, r.return_amount)
+      in
+      Printf.sprintf "%s: restocked %d item(s), refunded %s" rma restocked refund)

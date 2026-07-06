@@ -1,0 +1,10 @@
+_build/
+rust/temporal_bridge/target/
+dist/
+*.install
+*.merlin
+.DS_Store
+# Staged into lib/ by scripts/build-bridge.sh — generated, not source.
+lib/libtemporal_core_bridge.a
+lib/temporal_bridge.h
+# Cargo.lock IS committed (reproducible builds).

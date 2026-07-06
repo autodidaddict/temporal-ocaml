@@ -1,0 +1,17 @@
+; Pull lib/ffi/temporal_ffi into this library as an internal module rather than a
+; separate public library. It compiles as `Temporal__Temporal_ffi`, which odoc
+; hides (double-underscore rule) and which isn't separately installable — so the
+; FFI is invisible to both consumers and docs. temporal.mli seals the public API.
+(include_subdirs unqualified)
+
+(library
+ (name temporal)
+ (public_name temporal-ocaml)
+ (foreign_archives temporal_core_bridge)
+ (foreign_stubs
+  (language c)
+  (names stubs)
+  (extra_deps temporal_bridge.h))
+ (c_library_flags
+  (-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc))
+ (libraries eio))
