@@ -14,4 +14,4 @@
   (extra_deps temporal_bridge.h))
  (c_library_flags
   (-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc))
- (libraries eio))
+ (libraries eio yojson))

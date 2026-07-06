@@ -9,6 +9,9 @@
 
 (* The C/Rust FFI boundary lives entirely in the [temporal_ffi] library. *)
 
+(* Payload codecs (lib/codec.ml), re-exported as Temporal.Codec. *)
+module Codec = Codec
+
 (* ---- Coresdk: small dependency-free protobuf codec -------------------- *)
 (* Deliberately hand-rolled: no codegen, no ppx, no runtime library, no system
    protobuf — so consumers of this library inherit none of that. Covers exactly

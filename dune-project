@@ -11,5 +11,6 @@
   (ocaml (>= 5.1))
   (eio (>= 1.0))
   eio_main
+  yojson
   ; The Rust toolchain is a build dependency (cargo builds the staticlib).
   (conf-rust-2021 :build)))

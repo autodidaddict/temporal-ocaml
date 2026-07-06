@@ -4,6 +4,32 @@
     transport underneath is an implementation detail and is not part of this
     interface. *)
 
+(** Serialization for values that cross the Temporal boundary. A codec maps an
+    OCaml value to/from a Payload (JSON by default, for cross-SDK interop). Users
+    supply the JSON conversion for their own types — by hand or via a ppx in
+    their own app; the SDK depends on neither. *)
+module Codec : sig
+  type 'a t
+
+  val json :
+    encode:('a -> Yojson.Safe.t) -> decode:(Yojson.Safe.t -> 'a) -> 'a t
+
+  val string : string t
+  val int : int t
+  val bool : bool t
+  val float : float t
+  val unit : unit t
+
+  val list : 'a t -> 'a list t
+  val option : 'a t -> 'a option t
+  val pair : 'a t -> 'b t -> ('a * 'b) t
+
+  val to_bytes : 'a t -> 'a -> string
+  (** Serialize a value to its Payload wire bytes. *)
+
+  val of_bytes : 'a t -> string -> 'a
+end
+
 (** An activity: a plain function from input to output. *)
 module Activity : sig
   type ('input, 'output) t
