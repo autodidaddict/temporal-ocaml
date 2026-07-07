@@ -39,6 +39,22 @@ type wf_activation = { run_id : string; jobs : wf_job list }
 
 let decode_payloads_field r acc = Codec.decode_payload (Pb.Reader.bytes r) :: acc
 
+(* temporal.api.failure.v1.Failure { message=1; cause=4 }. An activity failure
+   arrives wrapped: the outer message is a generic "Activity task failed" and the
+   user's real error sits in the cause chain, so return the deepest message. *)
+let rec failure_message s =
+  let r = Pb.Reader.create s in
+  let msg = ref "" and cause = ref None in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 2 -> msg := Pb.Reader.bytes r
+    | 4, 2 -> cause := Some (Pb.Reader.bytes r)
+    | _, w -> Pb.Reader.skip r w
+  done;
+  match !cause with
+  | Some c -> ( match failure_message c with "" -> !msg | deeper -> deeper)
+  | None -> !msg
+
 (* activity_result.ActivityResolution { oneof { Success completed=1; Failure failed=2 } }
    activity_result.Success { Payload result = 1 } *)
 let decode_activity_resolution s =
@@ -56,12 +72,14 @@ let decode_activity_resolution s =
       done;
       res := Completed !p
     | 2, 2 ->
-      let fail = Pb.Reader.create (Pb.Reader.bytes r) in
+      (* activity_result.Failure { failure=1 } wraps a temporal...Failure; the
+         user's error is in its cause chain, so take the deepest message. *)
+      let wrapper = Pb.Reader.create (Pb.Reader.bytes r) in
       let msg = ref "" in
-      while not (Pb.Reader.at_end fail) do
-        match Pb.Reader.key fail with
-        | 1, 2 -> msg := Pb.Reader.bytes fail (* Failure.message = 1 *)
-        | _, w -> Pb.Reader.skip fail w
+      while not (Pb.Reader.at_end wrapper) do
+        match Pb.Reader.key wrapper with
+        | 1, 2 -> msg := failure_message (Pb.Reader.bytes wrapper)
+        | _, w -> Pb.Reader.skip wrapper w
       done;
       res := Failed !msg
     | _, w -> Pb.Reader.skip r w
@@ -142,6 +160,7 @@ type wf_command =
       task_queue : string;
       arguments : payload list;
       start_to_close : float; (* seconds *)
+      max_attempts : int; (* 0 = unlimited (server default); 1 disables retries *)
     }
   | Start_timer of { seq : int; start_to_fire : float (* seconds *) }
   | Complete_workflow_execution of payload option
@@ -158,13 +177,27 @@ let encode_duration seconds =
 
 let encode_payload_field w field p = Pb.Writer.bytes w field (Codec.encode_payload p)
 
-(* temporal.api.failure.v1.Failure { message=1; source=2 } — minimal; the
-   structured failure converter (cause chains, details as payloads) is future
-   work per ADR-0001. *)
+(* temporal.api.failure.v1.Failure { message=1; source=2; application_failure_info=5 }.
+   The application_failure_info { type=1 } marks it an application failure so core
+   can evaluate activity retryability — without it, a failed activity never
+   reaches the server and falls through to a start_to_close timeout. Richer
+   structured failures (cause chains, payload details) are future work per
+   ADR-0001. *)
 let encode_failure msg =
+  let info = Pb.Writer.create () in
+  Pb.Writer.bytes info 1 "ApplicationFailure" (* ApplicationFailureInfo.type = 1 *);
   let w = Pb.Writer.create () in
   Pb.Writer.bytes w 1 msg;
   Pb.Writer.bytes w 2 "OCamlSDK";
+  Pb.Writer.bytes w 5 (Pb.Writer.contents info) (* Failure.application_failure_info = 5 *);
+  Pb.Writer.contents w
+
+(* temporal.api.common.v1.RetryPolicy { maximum_attempts=4 (int32) }.
+   maximum_attempts: 1 disables retries; 0 (default) is unlimited (bounded by
+   timeouts). Emitted only when the caller set a cap. *)
+let encode_retry_policy max_attempts =
+  let w = Pb.Writer.create () in
+  Pb.Writer.int w 4 max_attempts;
   Pb.Writer.contents w
 
 (* -> a single WorkflowCommand *)
@@ -184,6 +217,8 @@ let encode_command = function
     Pb.Writer.bytes sa 5 a.task_queue;
     List.iter (encode_payload_field sa 7) a.arguments;
     Pb.Writer.bytes sa 10 (encode_duration a.start_to_close);
+    if a.max_attempts > 0 then
+      Pb.Writer.bytes sa 12 (encode_retry_policy a.max_attempts);
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 2 (Pb.Writer.contents sa);
     (* WorkflowCommand.schedule_activity = 2 *)
@@ -254,9 +289,11 @@ let encode_activity_completion ~task_token ~result =
      (match p with Some pl -> encode_payload_field succ 1 pl | None -> ());
      Pb.Writer.bytes exec 1 (Pb.Writer.contents succ)
    | Act_failed msg ->
-     let fail = Pb.Writer.create () in
-     Pb.Writer.bytes fail 1 msg;
-     Pb.Writer.bytes exec 2 (Pb.Writer.contents fail));
+     (* ActivityExecutionResult.failed = activity_result.Failure { failure=1 },
+        wrapping temporal.api.failure.v1.Failure { message=1 } *)
+     let wrapper = Pb.Writer.create () in
+     Pb.Writer.bytes wrapper 1 (encode_failure msg);
+     Pb.Writer.bytes exec 2 (Pb.Writer.contents wrapper));
   let w = Pb.Writer.create () in
   Pb.Writer.bytes w 1 task_token;
   Pb.Writer.bytes w 2 (Pb.Writer.contents exec);

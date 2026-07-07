@@ -22,7 +22,11 @@ open Model
 let order_workflow =
   Workflow.define ~name:"OrderWorkflow" ~input:order_codec ~output:Codec.string
     (fun ctx (o : order) ->
-      let total = Workflow.execute_activity ctx Activities.validate_order o in
+      (* validation is deterministic — a bad order won't pass on retry, so fail
+         fast (max_attempts:1) rather than retrying the default unlimited times *)
+      let total =
+        Workflow.execute_activity ~max_attempts:1 ctx Activities.validate_order o
+      in
       let charge =
         Workflow.execute_activity ctx Activities.charge_payment (o.order_id, total)
       in

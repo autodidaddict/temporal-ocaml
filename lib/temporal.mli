@@ -74,10 +74,18 @@ module Workflow : sig
   (** [define ~name ~input ~output f] declares a workflow called [name]. *)
 
   val execute_activity :
-    ?start_to_close:float -> ctx -> ('i, 'o) Activity.t -> 'i -> 'o
+    ?start_to_close:float ->
+    ?max_attempts:int ->
+    ctx ->
+    ('i, 'o) Activity.t ->
+    'i ->
+    'o
   (** [execute_activity ctx activity input] schedules [activity], waits for it,
       and returns its result. [start_to_close] is the activity timeout in
-      seconds (default 10). *)
+      seconds (default 10). [max_attempts] caps retries: 1 disables retries, 0
+      (the default) leaves it unlimited (bounded by the timeouts). An activity
+      that exhausts its attempts resolves as a failure, which raises in the
+      workflow body at the call site. *)
 
   val sleep : ctx -> float -> unit
   (** [sleep ctx seconds] durably suspends the workflow for [seconds] via a

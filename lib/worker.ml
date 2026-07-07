@@ -103,7 +103,7 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
         (fun (type a) (eff : a Effect.t) ->
           match eff with
           | Workflow.Schedule_activity_effect
-              { activity_type; arg; start_to_close } ->
+              { activity_type; arg; start_to_close; max_attempts } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr act_seq;
@@ -123,6 +123,7 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
                         task_queue = t.task_queue;
                         arguments = [ arg ];
                         start_to_close;
+                        max_attempts;
                       }
                     :: !commands)
           | Workflow.Start_timer_effect { start_to_fire } ->

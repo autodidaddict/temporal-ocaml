@@ -35,16 +35,17 @@ type _ Effect.t +=
       activity_type : string;
       arg : Codec.payload;
       start_to_close : float;
+      max_attempts : int;
     }
       -> Codec.payload Effect.t
 
-let execute_activity ?(start_to_close = 10.0) (_ : ctx)
+let execute_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : ctx)
     (a : ('i, 'o) Activity.t) (input : 'i) : 'o =
   let arg = Codec.to_payload a.Activity.input input in
   let result =
     Effect.perform
       (Schedule_activity_effect
-         { activity_type = a.Activity.name; arg; start_to_close })
+         { activity_type = a.Activity.name; arg; start_to_close; max_attempts })
   in
   Codec.of_payload a.Activity.output result
 
