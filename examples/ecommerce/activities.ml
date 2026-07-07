@@ -19,12 +19,12 @@ open Temporal
 open Model
 
 let validate_order =
-  Activity.define ~name:"validate_order" ~input:order_codec ~output:Codec.int
-    (fun (o : order) ->
+  Activity.define ~name:"validate_order" ~input:Order.codec ~output:Codec.int
+    (fun (o : Order.t) ->
       if o.items = [] then
         failwith
           (Printf.sprintf "order %s (%s) has no line items" o.order_id o.customer);
-      total_cents o.items)
+      Order.total_cents o.items)
 
 let charge_payment =
   Activity.define ~name:"charge_payment"
@@ -34,9 +34,9 @@ let charge_payment =
 
 let reserve_inventory =
   Activity.define ~name:"reserve_inventory"
-    ~input:(Codec.list line_item_codec) ~output:Codec.string
-    (fun (items : line_item list) ->
-      "rsv_" ^ String.concat "-" (List.map (fun (i : line_item) -> i.sku) items))
+    ~input:(Codec.list Line_item.codec) ~output:Codec.string
+    (fun (items : Line_item.t list) ->
+      "rsv_" ^ String.concat "-" (List.map (fun (i : Line_item.t) -> i.sku) items))
 
 let request_shipment =
   Activity.define ~name:"request_shipment"
@@ -46,8 +46,8 @@ let request_shipment =
 
 let pick_and_pack =
   Activity.define ~name:"pick_and_pack"
-    ~input:(Codec.list line_item_codec) ~output:Codec.string
-    (fun (items : line_item list) ->
+    ~input:(Codec.list Line_item.codec) ~output:Codec.string
+    (fun (items : Line_item.t list) ->
       Printf.sprintf "pkg_%d_items" (List.length items))
 
 let dispatch_carrier =
@@ -66,8 +66,8 @@ let authorize_return =
 
 let restock_inventory =
   Activity.define ~name:"restock_inventory"
-    ~input:(Codec.list line_item_codec) ~output:Codec.int
-    (fun (items : line_item list) -> List.length items)
+    ~input:(Codec.list Line_item.codec) ~output:Codec.int
+    (fun (items : Line_item.t list) -> List.length items)
 
 let refund_payment =
   Activity.define ~name:"refund_payment"

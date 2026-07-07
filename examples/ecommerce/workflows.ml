@@ -20,8 +20,8 @@ open Temporal
 open Model
 
 let order_workflow =
-  Workflow.define ~name:"OrderWorkflow" ~input:order_codec ~output:Codec.string
-    (fun ctx (o : order) ->
+  Workflow.define ~name:"OrderWorkflow" ~input:Order.codec ~output:Codec.string
+    (fun ctx (o : Order.t) ->
       (* validation is deterministic — a bad order won't pass on retry, so fail
          fast (max_attempts:1) rather than retrying the default unlimited times *)
       let total =
@@ -47,9 +47,9 @@ let order_workflow =
 
 let shipment_workflow =
   Workflow.define ~name:"ShipmentWorkflow"
-    ~input:Codec.(pair (list line_item_codec) string)
+    ~input:Codec.(pair (list Line_item.codec) string)
     ~output:Codec.string
-    (fun ctx ((items, ship_to) : line_item list * string) ->
+    (fun ctx ((items, ship_to) : Line_item.t list * string) ->
       let package = Workflow.execute_activity ctx Activities.pick_and_pack items in
       let tracking =
         Workflow.execute_activity ctx Activities.dispatch_carrier (package, ship_to)
@@ -58,9 +58,9 @@ let shipment_workflow =
       Workflow.execute_activity ctx Activities.confirm_delivery tracking)
 
 let return_workflow =
-  Workflow.define ~name:"ReturnWorkflow" ~input:return_request_codec
+  Workflow.define ~name:"ReturnWorkflow" ~input:Return_request.codec
     ~output:Codec.string
-    (fun ctx (r : return_request) ->
+    (fun ctx (r : Return_request.t) ->
       let rma =
         Workflow.execute_activity ctx Activities.authorize_return r.return_order
       in
