@@ -10,6 +10,7 @@ depends: [
   "eio_main"
   "yojson"
   "conf-rust-2021" {build}
+  "conf-protoc" {build}
   "odoc" {with-doc}
 ]
 build: [

@@ -12,6 +12,59 @@
   (language c)
   (names stubs)
   (extra_deps temporal_bridge.h))
+ ; Native libs the sdk-core staticlib pulls in — platform specific, so they're
+ ; generated per-OS below (`cargo rustc -- --print native-static-libs` is the
+ ; source of truth if deps change).
  (c_library_flags
-  (-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc))
+  (:include native_link_flags.sexp))
  (libraries eio yojson))
+
+; Per-OS linker flags for the staticlib. Two mutually-exclusive rules (guarded by
+; enabled_if) produce the same target, so exactly one applies on any platform.
+(rule
+ (target native_link_flags.sexp)
+ (enabled_if
+  (= %{ocaml-config:system} macosx))
+ (action
+  ; -lSystem is already linked by the OCaml compiler on macOS; omit it here to
+  ; avoid a duplicate-library linker warning. -lc/-lm resolve into libSystem too.
+  (write-file native_link_flags.sexp
+    "(-framework IOKit -framework CoreFoundation -framework Security -liconv -lc -lm)")))
+
+(rule
+ (target native_link_flags.sexp)
+ (enabled_if
+  (<> %{ocaml-config:system} macosx))
+ (action
+  (write-file native_link_flags.sexp
+    "(-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc)")))
+
+; Build the sdk-core staticlib with cargo AS PART OF the dune graph, so
+; `dune build @install` (and therefore `opam install`) is self-contained and no
+; longer needs a manual pre-step. `(foreign_archives temporal_core_bridge)` above
+; consumes the libtemporal_core_bridge.a target produced here.
+;
+; cargo builds into its own target/ dir (outside _build), which gives it real
+; incremental caching across dune builds; we copy just the finished archive into
+; the build dir as the rule's target. --locked pins to the committed Cargo.lock
+; for reproducibility. Needs `cargo` (conf-rust-2021) and `protoc` (conf-protoc)
+; on PATH — both declared as build deps in dune-project.
+(rule
+ (targets libtemporal_core_bridge.a)
+ (deps
+  ../rust/temporal_bridge/Cargo.toml
+  ../rust/temporal_bridge/Cargo.lock
+  (source_tree ../rust/temporal_bridge/src))
+ (action
+  (progn
+   (run cargo build --release --locked --manifest-path
+     ../rust/temporal_bridge/Cargo.toml)
+   (run cp ../rust/temporal_bridge/target/release/libtemporal_core_bridge.a
+     libtemporal_core_bridge.a))))
+
+; The C ABI header is committed source under rust/; stage it into the build dir
+; where stubs.c #includes it (see `(extra_deps temporal_bridge.h)` above).
+(rule
+ (target temporal_bridge.h)
+ (action
+  (copy ../rust/temporal_bridge/include/temporal_bridge.h temporal_bridge.h)))

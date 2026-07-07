@@ -12,5 +12,8 @@
   (eio (>= 1.0))
   eio_main
   yojson
-  ; The Rust toolchain is a build dependency (cargo builds the staticlib).
-  (conf-rust-2021 :build)))
+  ; Build deps for the sdk-core staticlib, which dune builds via cargo: the Rust
+  ; toolchain, and protoc (sdk-core's proto crate runs tonic-prost-build at
+  ; compile time).
+  (conf-rust-2021 :build)
+  (conf-protoc :build)))

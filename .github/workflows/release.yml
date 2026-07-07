@@ -47,11 +47,9 @@ jobs:
       - name: Install OCaml deps
         run: opam install . --deps-only --yes
 
-      # cargo is decoupled from dune: build+stage the staticlib first.
-      - name: Build Rust bridge
-        shell: bash
-        run: ./scripts/build-bridge.sh
-
+      # dune builds the Rust staticlib itself (cargo runs inside the dune graph;
+      # see lib/dune), so there's no separate staging step. The archive lands at
+      # _build/default/lib/libtemporal_core_bridge.a, which "Stage artifacts" ships.
       - name: Build (release)
         run: opam exec -- dune build --profile release examples/ecommerce/main.exe
 

@@ -4,7 +4,8 @@ dist/
 *.install
 *.merlin
 .DS_Store
-# Staged into lib/ by scripts/build-bridge.sh — generated, not source.
+# dune now builds these under _build (see lib/dune). Ignored here only to guard
+# against stale copies left in the source tree by the old staging script.
 lib/libtemporal_core_bridge.a
 lib/temporal_bridge.h
 # Cargo.lock IS committed (reproducible builds).

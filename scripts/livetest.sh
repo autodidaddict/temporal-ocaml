@@ -5,8 +5,8 @@
 # drives real workflows through the public API and asserts the outcomes against
 # server history — the same checks that caught every wire-format and semantic bug
 # during development. This is an integration test: it needs the `temporal` CLI,
-# python3, and the built worker (run scripts/build-bridge.sh first if the Rust
-# bridge isn't staged yet).
+# python3, cargo + protoc (dune builds the Rust bridge on demand), and builds the
+# worker below.
 #
 # Scenarios:
 #   1. happy path        -> WORKFLOW_EXECUTION_STATUS_COMPLETED + composed result
@@ -42,7 +42,7 @@ command -v python3  >/dev/null || { echo "python3 not found on PATH"; exit 2; }
 log "building example worker"
 if ! (cd "$root" && dune build examples/ecommerce/main.exe) 2>"$tmp/build.err"; then
   cat "$tmp/build.err"
-  echo "build failed — is the Rust bridge staged? run scripts/build-bridge.sh"
+  echo "build failed — dune builds the Rust bridge via cargo; is cargo + protoc on PATH?"
   exit 2
 fi
 

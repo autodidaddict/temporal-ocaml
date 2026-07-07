@@ -2,13 +2,15 @@
 
 all: build
 
-# Build the Rust staticlib and stage it into lib/ (cargo is decoupled from dune).
+# Build just the Rust staticlib through dune (cargo runs inside the dune graph;
+# see lib/dune). Handy when iterating on the bridge in isolation.
 bridge:
-	./scripts/build-bridge.sh
+	dune build lib/libtemporal_core_bridge.a
 
-# Full build: staticlib, then OCaml + link. We target the native exe (we ship a
-# static .a only, not a shared dll, so we skip dune's bytecode/install path).
-build: bridge
+# Full build. dune builds the staticlib (via cargo) and links it automatically,
+# so there's no separate bridge step. We target the native exe (we ship a static
+# .a only, not a shared dll, so we skip dune's bytecode/install path).
+build:
 	dune build examples/ecommerce/main.exe
 
 # Run the example worker (boots real sdk-core, connects, polls task queues).
