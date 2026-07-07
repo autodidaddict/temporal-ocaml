@@ -94,8 +94,11 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
           commands := [ Coresdk.Complete_workflow_execution (Some output) ]);
       exnc =
         (fun exn ->
-          Eio.traceln "[wf] body raised: %s" (Printexc.to_string exn);
-          commands := []);
+          (* an uncaught exception in the workflow body fails the execution;
+             catch it in the body (try/with) to compensate and continue (saga) *)
+          let msg = Printexc.to_string exn in
+          Eio.traceln "[wf] failing workflow execution: %s" msg;
+          commands := [ Coresdk.Fail_workflow_execution msg ]);
       effc =
         (fun (type a) (eff : a Effect.t) ->
           match eff with

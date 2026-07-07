@@ -145,6 +145,7 @@ type wf_command =
     }
   | Start_timer of { seq : int; start_to_fire : float (* seconds *) }
   | Complete_workflow_execution of payload option
+  | Fail_workflow_execution of string
 
 (* google.protobuf.Duration { int64 seconds=1; int32 nanos=2 } *)
 let encode_duration seconds =
@@ -156,6 +157,15 @@ let encode_duration seconds =
   Pb.Writer.contents w
 
 let encode_payload_field w field p = Pb.Writer.bytes w field (Codec.encode_payload p)
+
+(* temporal.api.failure.v1.Failure { message=1; source=2 } — minimal; the
+   structured failure converter (cause chains, details as payloads) is future
+   work per ADR-0001. *)
+let encode_failure msg =
+  let w = Pb.Writer.create () in
+  Pb.Writer.bytes w 1 msg;
+  Pb.Writer.bytes w 2 "OCamlSDK";
+  Pb.Writer.contents w
 
 (* -> a single WorkflowCommand *)
 let encode_command = function
@@ -185,6 +195,13 @@ let encode_command = function
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 1 (Pb.Writer.contents st);
     (* WorkflowCommand.start_timer = 1 *)
+    Pb.Writer.contents cmd
+  | Fail_workflow_execution msg ->
+    let fwe = Pb.Writer.create () in
+    Pb.Writer.bytes fwe 1 (encode_failure msg);
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 7 (Pb.Writer.contents fwe);
+    (* WorkflowCommand.fail_workflow_execution = 7 *)
     Pb.Writer.contents cmd
 
 (* WorkflowActivationCompletion { run_id=1; successful=2 = Success{ commands=1 } } *)
