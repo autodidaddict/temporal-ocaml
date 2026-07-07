@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# End-to-end smoke test for the OCaml Temporal SDK.
+#
+# Boots a throwaway Temporal dev server and the e-commerce example worker, then
+# drives real workflows through the public API and asserts the outcomes against
+# server history — the same checks that caught every wire-format and semantic bug
+# during development. This is an integration test: it needs the `temporal` CLI,
+# python3, and the built worker (run scripts/build-bridge.sh first if the Rust
+# bridge isn't staged yet).
+#
+# Scenarios:
+#   1. happy path        -> WORKFLOW_EXECUTION_STATUS_COMPLETED + composed result
+#   2. durable timer     -> TIMER_STARTED + TIMER_FIRED in history
+#   3. activity failure  -> WORKFLOW_EXECUTION_STATUS_FAILED + root-cause message
+#
+# Exit: 0 all passed, 1 an assertion failed, 2 setup/prerequisite problem.
+set -uo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+worker="$root/_build/default/examples/ecommerce/main.exe"
+port="${TEMPORAL_SMOKE_PORT:-17233}"
+task_queue=ecommerce
+tmp="$(mktemp -d)"
+fails=0
+
+log()  { printf '\n== %s ==\n' "$*"; }
+pass() { printf '  ok   %s\n' "$*"; }
+fail() { printf '  FAIL %s\n' "$*"; fails=$((fails + 1)); }
+
+cleanup() {
+  [ -n "${WK:-}" ] && kill "$WK" 2>/dev/null
+  [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null
+  wait 2>/dev/null
+  rm -rf "$tmp"
+}
+trap cleanup EXIT INT TERM
+
+# ---- prerequisites ------------------------------------------------------------
+command -v temporal >/dev/null || { echo "temporal CLI not found on PATH"; exit 2; }
+command -v python3  >/dev/null || { echo "python3 not found on PATH"; exit 2; }
+
+log "building example worker"
+if ! (cd "$root" && dune build examples/ecommerce/main.exe) 2>"$tmp/build.err"; then
+  cat "$tmp/build.err"
+  echo "build failed — is the Rust bridge staged? run scripts/build-bridge.sh"
+  exit 2
+fi
+
+# The CLI and worker both point at our private headless server, so this never
+# collides with a dev server the user already has on the default ports.
+export TEMPORAL_ADDRESS="localhost:$port"
+
+# ---- boot server + worker -----------------------------------------------------
+log "starting temporal dev server (headless, port $port)"
+temporal server start-dev --headless --port "$port" >"$tmp/server.log" 2>&1 &
+SRV=$!
+for _ in $(seq 1 60); do temporal operator namespace list >/dev/null 2>&1 && break; sleep 1; done
+temporal operator namespace list >/dev/null 2>&1 || { echo "server never became ready"; cat "$tmp/server.log"; exit 2; }
+
+log "starting worker"
+TEMPORAL_TARGET="http://localhost:$port" TEMPORAL_TASK_QUEUE="$task_queue" \
+  "$worker" >"$tmp/worker.log" 2>&1 &
+WK=$!
+for _ in $(seq 1 30); do grep -q "worker polling" "$tmp/worker.log" && break; sleep 1; done
+grep -q "worker polling" "$tmp/worker.log" || { echo "worker never started polling"; cat "$tmp/worker.log"; exit 2; }
+
+# ---- helpers ------------------------------------------------------------------
+start_wf() { # id type input
+  temporal workflow start --task-queue "$task_queue" --type "$2" \
+    --workflow-id "$1" --input "$3" >/dev/null 2>&1
+}
+status() { # id -> status string
+  temporal workflow describe --workflow-id "$1" --output json 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["workflowExecutionInfo"]["status"])' 2>/dev/null
+}
+await_terminal() { # id -> final (non-Running) status
+  local s
+  for _ in $(seq 1 30); do
+    s="$(status "$1")"
+    case "$s" in ""|Running|*RUNNING) sleep 1 ;; *) echo "$s"; return ;; esac
+  done
+  echo "${s:-TIMEOUT}"
+}
+result() { # id -> decoded completed result value
+  temporal workflow show --workflow-id "$1" --output json 2>/dev/null | python3 -c '
+import sys, json, base64
+d = json.load(sys.stdin)
+ev = [e for e in d["events"] if "workflowExecutionCompletedEventAttributes" in e]
+if ev:
+    print(base64.b64decode(ev[0]["workflowExecutionCompletedEventAttributes"]["result"]["payloads"][0]["data"]).decode())
+' 2>/dev/null
+}
+failure_msg() { # id -> failure message
+  temporal workflow show --workflow-id "$1" --output json 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+ev = [e for e in d["events"] if "workflowExecutionFailedEventAttributes" in e]
+print(ev[0]["workflowExecutionFailedEventAttributes"]["failure"].get("message", "") if ev else "")
+' 2>/dev/null
+}
+has_events() { # id type-substring... -> yes|no
+  local id="$1"; shift
+  temporal workflow show --workflow-id "$id" --output json 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+types = {e["eventType"] for e in d["events"]}
+want = sys.argv[1:]
+print("yes" if all(any(w in t for t in types) for w in want) else "no")
+' "$@" 2>/dev/null
+}
+
+# ---- scenario 1 + 2: happy path with a durable timer --------------------------
+log "scenario 1+2: happy path + durable timer"
+order='{"order_id":"o-1","customer":"alice","ship_to":"123 Main St","items":[{"sku":"WIDGET","qty":2,"unit_price":1500},{"sku":"GADGET","qty":1,"unit_price":1200}]}'
+start_wf smoke-ok OrderWorkflow "$order"
+st="$(await_terminal smoke-ok)"
+case "$st" in *COMPLETED) pass "happy path COMPLETED" ;; *) fail "happy path status: $st" ;; esac
+res="$(result smoke-ok)"
+case "$res" in
+  *"charged ch_o-1_4200, reserved rsv_WIDGET-GADGET, shipment shp_o-1"*) pass "composed result value" ;;
+  *) fail "unexpected result: $res" ;;
+esac
+case "$(has_events smoke-ok TIMER_STARTED TIMER_FIRED)" in
+  yes) pass "durable timer started and fired" ;;
+  *)   fail "timer events missing from history" ;;
+esac
+
+# ---- scenario 3: activity failure fails the workflow --------------------------
+log "scenario 3: activity failure -> workflow FAILED"
+start_wf smoke-bad OrderWorkflow '{"order_id":"o-empty","customer":"bob","ship_to":"123 Main St","items":[]}'
+st="$(await_terminal smoke-bad)"
+case "$st" in *FAILED) pass "bad order FAILED" ;; *) fail "bad order status: $st" ;; esac
+msg="$(failure_msg smoke-bad)"
+case "$msg" in *"no line items"*) pass "root-cause message surfaced" ;; *) fail "unexpected failure message: $msg" ;; esac
+
+# ---- scenario 4: continue-as-new ----------------------------------------------
+log "scenario 4: continue-as-new"
+# n=2 => run1 continues-as-new to run2 continues-as-new to run3, which completes.
+# Reaching the countdown-finished result is only possible if the CAN chain ran.
+start_wf smoke-can CountdownWorkflow '2'
+st="$(await_terminal smoke-can)"
+case "$st" in *COMPLETED) pass "countdown COMPLETED after continue-as-new chain" ;; *) fail "countdown status: $st" ;; esac
+res="$(result smoke-can)"
+case "$res" in *"countdown finished"*) pass "reached completion via continue-as-new" ;; *) fail "unexpected result: $res" ;; esac
+
+# ---- summary ------------------------------------------------------------------
+echo
+if [ "$fails" -eq 0 ]; then
+  echo "SMOKE TEST PASSED"
+  exit 0
+else
+  echo "SMOKE TEST FAILED ($fails check(s))"
+  exit 1
+fi
