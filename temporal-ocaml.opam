@@ -8,6 +8,7 @@ depends: [
   "ocaml" {>= "5.1"}
   "eio" {>= "1.0"}
   "eio_main"
+  "yojson"
   "conf-rust-2021" {build}
   "odoc" {with-doc}
 ]
