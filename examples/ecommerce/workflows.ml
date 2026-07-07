@@ -72,3 +72,15 @@ let return_workflow =
           (r.return_charge, r.return_amount)
       in
       Printf.sprintf "%s: restocked %d item(s), refunded %s" rma restocked refund)
+
+(* Demonstrates continue-as-new: each run does its unit of work and then starts a
+   fresh run with decremented state, keeping history bounded. A real long-running
+   workflow would loop on [continue_as_new_suggested] instead of a fixed count. *)
+let countdown_workflow =
+  Workflow.define ~name:"CountdownWorkflow" ~input:Codec.int ~output:Codec.string
+    (fun ctx (n : int) ->
+      if n > 0 then Workflow.continue_as_new ctx (n - 1)
+      else
+        Printf.sprintf "countdown finished (suggested=%b, history=%d)"
+          (Workflow.continue_as_new_suggested ctx)
+          (Workflow.history_length ctx))

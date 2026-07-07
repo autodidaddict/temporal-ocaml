@@ -35,7 +35,12 @@ type wf_job =
   | Remove_from_cache
   | Other
 
-type wf_activation = { run_id : string; jobs : wf_job list }
+type wf_activation = {
+  run_id : string;
+  jobs : wf_job list;
+  continue_as_new_suggested : bool;
+  history_length : int;
+}
 
 let decode_payloads_field r acc = Codec.decode_payload (Pb.Reader.bytes r) :: acc
 
@@ -138,17 +143,25 @@ let decode_wf_job s =
   done;
   !job
 
-(* WorkflowActivation { run_id=1; jobs=5 (repeated WorkflowActivationJob) } *)
+(* WorkflowActivation { run_id=1; history_length=4 (uint32); jobs=5 (repeated);
+   continue_as_new_suggested=8 (bool) } *)
 let decode_wf_activation s =
   let r = Pb.Reader.create s in
   let run_id = ref "" and jobs = ref [] in
+  let history_length = ref 0 and can_suggested = ref false in
   while not (Pb.Reader.at_end r) do
     match Pb.Reader.key r with
     | 1, 2 -> run_id := Pb.Reader.bytes r
+    | 4, 0 -> history_length := Pb.Reader.varint r
     | 5, 2 -> jobs := decode_wf_job (Pb.Reader.bytes r) :: !jobs
+    | 8, 0 -> can_suggested := Pb.Reader.varint r <> 0
     | _, w -> Pb.Reader.skip r w
   done;
-  { run_id = !run_id; jobs = List.rev !jobs }
+  { run_id = !run_id;
+    jobs = List.rev !jobs;
+    continue_as_new_suggested = !can_suggested;
+    history_length = !history_length;
+  }
 
 (* ---- encode: WorkflowActivationCompletion ----------------------------- *)
 
@@ -165,6 +178,7 @@ type wf_command =
   | Start_timer of { seq : int; start_to_fire : float (* seconds *) }
   | Complete_workflow_execution of payload option
   | Fail_workflow_execution of string
+  | Continue_as_new of { arguments : payload list }
 
 (* google.protobuf.Duration { int64 seconds=1; int32 nanos=2 } *)
 let encode_duration seconds =
@@ -237,6 +251,14 @@ let encode_command = function
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 7 (Pb.Writer.contents fwe);
     (* WorkflowCommand.fail_workflow_execution = 7 *)
+    Pb.Writer.contents cmd
+  | Continue_as_new c ->
+    let can = Pb.Writer.create () in
+    List.iter (encode_payload_field can 3) c.arguments;
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 8 (Pb.Writer.contents can);
+    (* WorkflowCommand.continue_as_new_workflow_execution = 8;
+       ContinueAsNewWorkflowExecution.arguments = 3 *)
     Pb.Writer.contents cmd
 
 (* WorkflowActivationCompletion { run_id=1; successful=2 = Success{ commands=1 } } *)

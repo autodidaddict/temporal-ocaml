@@ -73,12 +73,11 @@ let get_run run_id =
     Hashtbl.replace runs run_id s;
     s
 
-let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
-    Coresdk.wf_command list =
+let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
+    ~history_length : Coresdk.wf_command list =
   let commands = ref [] in
   let act_seq = ref 0 in
   let timer_seq = ref 0 in
-  let ctx = Workflow.{ task_queue = t.task_queue } in
   let arg =
     match state.init_arg with
     | Some p -> p
@@ -86,7 +85,8 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
   in
   let open Effect.Deep in
   match_with
-    (fun () -> wf.Workflow.body ctx arg)
+    (fun () ->
+      wf.Workflow.body ~task_queue:t.task_queue ~can_suggested ~history_length arg)
     ()
     {
       retc =
@@ -135,6 +135,11 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
                 else
                   commands :=
                     Coresdk.Start_timer { seq = s; start_to_fire } :: !commands)
+          | Workflow.Continue_as_new_effect new_arg ->
+            Some
+              (fun (_ : (a, unit) continuation) ->
+                (* terminal: end this run, start a fresh one; drop the k *)
+                commands := [ Coresdk.Continue_as_new { arguments = [ new_arg ] } ])
           | _ -> None);
     };
   List.rev !commands
@@ -179,7 +184,10 @@ let workflow_loop (t : t) =
               (fun (w : Workflow.reg) -> w.Workflow.name = state.wf_name)
               t.workflows
           with
-          | Some wf -> run_workflow t wf state
+          | Some wf ->
+            run_workflow t wf state
+              ~can_suggested:a.Coresdk.continue_as_new_suggested
+              ~history_length:a.Coresdk.history_length
           | None ->
             Eio.traceln "[wf] no workflow registered as %S" state.wf_name;
             []

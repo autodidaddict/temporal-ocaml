@@ -20,10 +20,6 @@
      workflows.ml  — workflow definitions (deterministic orchestration)
      main.ml       — connect, register, run
 
-   M1 caveat: the runtime doesn't drive workflow bodies yet (execute_activity
-   raises), so running this registers everything, connects, and completes the
-   workflow tasks it receives.
-
    Run:
      temporal server start-dev
      make run
@@ -59,5 +55,6 @@ let () =
     |> register_workflow order_workflow
     |> register_workflow shipment_workflow
     |> register_workflow return_workflow
+    |> register_workflow countdown_workflow
   in
   Worker.run worker

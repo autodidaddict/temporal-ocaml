@@ -15,13 +15,18 @@
 (* A workflow: deterministic orchestration of activities. Re-exported as
    Temporal.Workflow. *)
 
-type ctx = { task_queue : string }
+type 'input ctx = {
+  task_queue : string;
+  continue_as_new_suggested : bool; (* this activation *)
+  history_length : int; (* events in this run's history so far *)
+  encode_input : 'input -> Codec.payload; (* the workflow's own input codec *)
+}
 
 type ('i, 'o) t = {
   name : string;
   input : 'i Codec.t;
   output : 'o Codec.t;
-  run : ctx -> 'i -> 'o;
+  run : 'i ctx -> 'i -> 'o;
 }
 
 let define ~name ~input ~output run = { name; input; output; run }
@@ -39,7 +44,7 @@ type _ Effect.t +=
     }
       -> Codec.payload Effect.t
 
-let execute_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : ctx)
+let execute_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : _ ctx)
     (a : ('i, 'o) Activity.t) (input : 'i) : 'o =
   let arg = Codec.to_payload a.Activity.input input in
   let result =
@@ -53,14 +58,44 @@ let execute_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : ctx)
    the run, resuming when the matching FireTimer job arrives. *)
 type _ Effect.t += Start_timer_effect : { start_to_fire : float } -> unit Effect.t
 
-let sleep (_ : ctx) (seconds : float) : unit =
+let sleep (_ : _ ctx) (seconds : float) : unit =
   Effect.perform (Start_timer_effect { start_to_fire = seconds })
 
-(* registered form: run the body on the decoded init arg, return output payload *)
-type reg = { name : string; body : ctx -> Codec.payload -> Codec.payload }
+(* continue_as_new ends this run and atomically starts a fresh one (same workflow
+   id, new run id, empty history) with new input; the handler emits the terminal
+   command and never resumes, so this does not return. *)
+type _ Effect.t += Continue_as_new_effect : Codec.payload -> unit Effect.t
+
+let continue_as_new (ctx : 'i ctx) (new_input : 'i) : 'a =
+  Effect.perform (Continue_as_new_effect (ctx.encode_input new_input));
+  assert false (* the handler drops this continuation; execution never resumes *)
+
+(* core suggests continue-as-new once history grows past the worker's threshold;
+   both signals are deterministic on replay, so branching on them is safe. *)
+let continue_as_new_suggested (ctx : _ ctx) : bool = ctx.continue_as_new_suggested
+let history_length (ctx : _ ctx) : int = ctx.history_length
+
+(* registered form: builds the typed ctx (carrying the workflow's own input
+   encoder) from the per-activation runtime info, then runs the body. *)
+type reg = {
+  name : string;
+  body :
+    task_queue:string ->
+    can_suggested:bool ->
+    history_length:int ->
+    Codec.payload ->
+    Codec.payload;
+}
 
 let reg (t : (_, _) t) =
   { name = t.name;
     body =
-      (fun ctx p ->
+      (fun ~task_queue ~can_suggested ~history_length p ->
+        let ctx =
+          { task_queue;
+            continue_as_new_suggested = can_suggested;
+            history_length;
+            encode_input = Codec.to_payload t.input;
+          }
+        in
         Codec.to_payload t.output (t.run ctx (Codec.of_payload t.input p))) }

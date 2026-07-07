@@ -60,8 +60,9 @@ end
 
 (** A workflow: deterministic orchestration of activities. *)
 module Workflow : sig
-  type ctx
-  (** The context threaded through a workflow body. *)
+  type 'input ctx
+  (** The context threaded through a workflow body, parameterized by the
+      workflow's own input type so {!continue_as_new} can re-encode it. *)
 
   type ('input, 'output) t
 
@@ -69,14 +70,14 @@ module Workflow : sig
     name:string ->
     input:'input Codec.t ->
     output:'output Codec.t ->
-    (ctx -> 'input -> 'output) ->
+    ('input ctx -> 'input -> 'output) ->
     ('input, 'output) t
   (** [define ~name ~input ~output f] declares a workflow called [name]. *)
 
   val execute_activity :
     ?start_to_close:float ->
     ?max_attempts:int ->
-    ctx ->
+    _ ctx ->
     ('i, 'o) Activity.t ->
     'i ->
     'o
@@ -87,10 +88,24 @@ module Workflow : sig
       that exhausts its attempts resolves as a failure, which raises in the
       workflow body at the call site. *)
 
-  val sleep : ctx -> float -> unit
+  val sleep : _ ctx -> float -> unit
   (** [sleep ctx seconds] durably suspends the workflow for [seconds] via a
       Temporal timer — it survives worker restarts and is deterministic on
       replay, unlike a wall-clock [Unix.sleep]. *)
+
+  val continue_as_new : 'input ctx -> 'input -> 'a
+  (** [continue_as_new ctx input] ends the current run and atomically starts a
+      fresh run of the same workflow — same workflow id, new run id, empty
+      history — with [input]. It does not return. Use it to bound history growth
+      in long-running or looping workflows. *)
+
+  val continue_as_new_suggested : _ ctx -> bool
+  (** Whether core suggests continuing-as-new now (this run's history has grown
+      past the worker's threshold). Deterministic on replay, so safe to branch
+      on. *)
+
+  val history_length : _ ctx -> int
+  (** Number of events in this run's history so far. Deterministic on replay. *)
 end
 
 (** A connection to a Temporal server. *)
