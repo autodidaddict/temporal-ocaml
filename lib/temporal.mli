@@ -36,12 +36,6 @@ module Activity : sig
 
   val define : name:string -> ('input -> 'output) -> ('input, 'output) t
   (** [define ~name f] declares an activity called [name], implemented by [f]. *)
-
-  type reg
-  (** A registered activity with its input/output types erased, for
-      {!Worker.create}. *)
-
-  val reg : (_, _) t -> reg
 end
 
 (** A workflow: deterministic orchestration of activities. *)
@@ -58,12 +52,6 @@ module Workflow : sig
   val execute_activity : ctx -> ('i, 'o) Activity.t -> 'i -> 'o
   (** [execute_activity ctx activity input] runs [activity] and returns its
       result. *)
-
-  type reg
-  (** A registered workflow with its input/output types erased, for
-      {!Worker.create}. *)
-
-  val reg : (_, _) t -> reg
 end
 
 (** A connection to a Temporal server. *)
@@ -81,14 +69,15 @@ end
 module Worker : sig
   type t
 
-  val create :
-    Client.t ->
-    task_queue:string ->
-    workflows:Workflow.reg list ->
-    activities:Activity.reg list ->
-    t
-  (** [create client ~task_queue ~workflows ~activities] builds a worker bound
-      to [task_queue]. *)
+  val create : Client.t -> task_queue:string -> t
+  (** [create client ~task_queue] builds an empty worker bound to [task_queue].
+      Register with {!register_workflow} / {!register_activity}. *)
+
+  val register_workflow : (_, _) Workflow.t -> t -> t
+  (** [worker |> register_workflow w] registers workflow [w]. *)
+
+  val register_activity : (_, _) Activity.t -> t -> t
+  (** [worker |> register_activity a] registers activity [a]. *)
 
   val run : t -> unit
   (** Start polling. Blocks until the process is stopped. *)

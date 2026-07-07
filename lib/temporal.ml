@@ -76,15 +76,21 @@ module Worker = struct
     activities : Activity.reg list;
   }
 
-  let create (client : Client.t) ~task_queue ~workflows ~activities =
-    List.iter
-      (fun w -> Eio.traceln "registered workflow: %s" (Workflow.name w))
-      workflows;
-    List.iter
-      (fun a -> Eio.traceln "registered activity: %s" (Activity.name a))
-      activities;
+  let create (client : Client.t) ~task_queue =
     let worker = Temporal_ffi.worker_new client.Client.conn task_queue in
-    { client; worker; task_queue; workflows; activities }
+    { client; worker; task_queue; workflows = []; activities = [] }
+
+  (* Pipe-friendly registration: the phantom types are erased in here, so the
+     [reg] existential never appears in user code. *)
+  let register_workflow (w : (_, _) Workflow.t) (t : t) : t =
+    let r = Workflow.reg w in
+    Eio.traceln "registered workflow: %s" (Workflow.name r);
+    { t with workflows = r :: t.workflows }
+
+  let register_activity (a : (_, _) Activity.t) (t : t) : t =
+    let r = Activity.reg a in
+    Eio.traceln "registered activity: %s" (Activity.name r);
+    { t with activities = r :: t.activities }
 
   (* Complete each workflow task. On the initial activation we emit a real
      CompleteWorkflowExecution command so the workflow finishes (Completed in

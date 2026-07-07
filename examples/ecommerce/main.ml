@@ -28,21 +28,22 @@ let () =
   Eio.traceln "connecting to %s ..." target;
   let client = Client.connect env ~target in
   let worker =
-    Worker.create client ~task_queue
-      ~workflows:
-        [ Workflow.reg Workflows.order_workflow;
-          Workflow.reg Workflows.shipment_workflow;
-          Workflow.reg Workflows.return_workflow ]
-      ~activities:
-        [ Activity.reg Activities.validate_order;
-          Activity.reg Activities.charge_payment;
-          Activity.reg Activities.reserve_inventory;
-          Activity.reg Activities.request_shipment;
-          Activity.reg Activities.pick_and_pack;
-          Activity.reg Activities.dispatch_carrier;
-          Activity.reg Activities.confirm_delivery;
-          Activity.reg Activities.authorize_return;
-          Activity.reg Activities.restock_inventory;
-          Activity.reg Activities.refund_payment ]
+    let open Worker in
+    let open Activities in
+    let open Workflows in
+    create client ~task_queue
+    |> register_activity validate_order
+    |> register_activity charge_payment
+    |> register_activity reserve_inventory
+    |> register_activity request_shipment
+    |> register_activity pick_and_pack
+    |> register_activity dispatch_carrier
+    |> register_activity confirm_delivery
+    |> register_activity authorize_return
+    |> register_activity restock_inventory
+    |> register_activity refund_payment
+    |> register_workflow order_workflow
+    |> register_workflow shipment_workflow
+    |> register_workflow return_workflow
   in
   Worker.run worker
