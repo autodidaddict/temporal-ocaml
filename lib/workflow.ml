@@ -75,6 +75,24 @@ let continue_as_new (ctx : 'i ctx) (new_input : 'i) : 'a =
 let continue_as_new_suggested (ctx : _ ctx) : bool = ctx.continue_as_new_suggested
 let history_length (ctx : _ ctx) : int = ctx.history_length
 
+(* on_signal registers a handler (the signal's decoder composed with the user's
+   callback); the worker fires it as the replay cursor passes a matching signal
+   event. wait_condition blocks the body until [pred] holds, re-checked after each
+   activation delivers new events. *)
+type _ Effect.t +=
+  | Register_signal_handler_effect :
+      string * (Codec.payload -> unit)
+      -> unit Effect.t
+  | Wait_condition_effect : (unit -> bool) -> unit Effect.t
+
+let on_signal (_ : _ ctx) (s : 'a Signal.t) (handler : 'a -> unit) : unit =
+  Effect.perform
+    (Register_signal_handler_effect
+       (s.Signal.name, fun p -> handler (Codec.of_payload s.Signal.codec p)))
+
+let wait_condition (_ : _ ctx) (pred : unit -> bool) : unit =
+  Effect.perform (Wait_condition_effect pred)
+
 (* registered form: builds the typed ctx (carrying the workflow's own input
    encoder) from the per-activation runtime info, then runs the body. *)
 type reg = {

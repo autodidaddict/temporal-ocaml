@@ -32,6 +32,7 @@ type wf_job =
   | Initialize_workflow of { workflow_type : string; arguments : payload list }
   | Resolve_activity of { seq : int; result : activity_resolution }
   | Fire_timer of { seq : int }
+  | Signal_workflow of { signal_name : string; input : payload list }
   | Remove_from_cache
   | Other
 
@@ -126,8 +127,20 @@ let decode_fire_timer s =
   done;
   Fire_timer { seq = !seq }
 
+(* SignalWorkflow { signal_name=1; input=2 (repeated Payload) } *)
+let decode_signal_workflow s =
+  let r = Pb.Reader.create s in
+  let name = ref "" and input = ref [] in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 2 -> name := Pb.Reader.bytes r
+    | 2, 2 -> input := decode_payloads_field r !input
+    | _, w -> Pb.Reader.skip r w
+  done;
+  Signal_workflow { signal_name = !name; input = List.rev !input }
+
 (* WorkflowActivationJob { oneof { initialize_workflow=1; fire_timer=2;
-   resolve_activity=8; remove_from_cache=50 } } *)
+   signal_workflow=7; resolve_activity=8; remove_from_cache=50 } } *)
 let decode_wf_job s =
   let r = Pb.Reader.create s in
   let job = ref Other in
@@ -135,6 +148,7 @@ let decode_wf_job s =
     match Pb.Reader.key r with
     | 1, 2 -> job := decode_initialize (Pb.Reader.bytes r)
     | 2, 2 -> job := decode_fire_timer (Pb.Reader.bytes r)
+    | 7, 2 -> job := decode_signal_workflow (Pb.Reader.bytes r)
     | 8, 2 -> job := decode_resolve_activity (Pb.Reader.bytes r)
     | 50, 2 ->
       ignore (Pb.Reader.bytes r);

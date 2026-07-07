@@ -84,3 +84,19 @@ let countdown_workflow =
         Printf.sprintf "countdown finished (suggested=%b, history=%d)"
           (Workflow.continue_as_new_suggested ctx)
           (Workflow.history_length ctx))
+
+(* Demonstrates signals + wait_condition: the workflow blocks until it receives an
+   approve or reject signal, then completes with the decision. reject carries a
+   typed argument (the reason string). *)
+let approve = Signal.define ~name:"approve" Codec.unit
+let reject = Signal.define ~name:"reject" Codec.string
+
+let approval_workflow =
+  Workflow.define ~name:"ApprovalWorkflow" ~input:Codec.string ~output:Codec.string
+    (fun ctx (subject : string) ->
+      let decision = ref None in
+      Workflow.on_signal ctx approve (fun () -> decision := Some "approved");
+      Workflow.on_signal ctx reject (fun reason ->
+          decision := Some ("rejected: " ^ reason));
+      Workflow.wait_condition ctx (fun () -> !decision <> None);
+      Printf.sprintf "%s -> %s" subject (Option.get !decision))

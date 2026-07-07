@@ -143,6 +143,25 @@ case "$st" in *COMPLETED) pass "countdown COMPLETED after continue-as-new chain"
 res="$(result smoke-can)"
 case "$res" in *"countdown finished"*) pass "reached completion via continue-as-new" ;; *) fail "unexpected result: $res" ;; esac
 
+# ---- scenario 5: signals + wait_condition -------------------------------------
+log "scenario 5: signals + wait_condition"
+# approve path: workflow blocks on wait_condition until the signal arrives
+start_wf smoke-approve ApprovalWorkflow '"expense-42"'
+sleep 2
+temporal workflow signal --workflow-id smoke-approve --name approve >/dev/null 2>&1
+st="$(await_terminal smoke-approve)"
+case "$st" in *COMPLETED) pass "approve signal COMPLETED" ;; *) fail "approve status: $st" ;; esac
+res="$(result smoke-approve)"
+case "$res" in *"expense-42 -> approved"*) pass "approve decision recorded" ;; *) fail "approve result: $res" ;; esac
+# reject path: signal carries a typed string argument
+start_wf smoke-reject ApprovalWorkflow '"expense-43"'
+sleep 2
+temporal workflow signal --workflow-id smoke-reject --name reject --input '"too expensive"' >/dev/null 2>&1
+st="$(await_terminal smoke-reject)"
+case "$st" in *COMPLETED) pass "reject signal COMPLETED" ;; *) fail "reject status: $st" ;; esac
+res="$(result smoke-reject)"
+case "$res" in *"expense-43 -> rejected: too expensive"*) pass "reject decision + typed reason" ;; *) fail "reject result: $res" ;; esac
+
 # ---- summary ------------------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then

@@ -59,6 +59,7 @@ type resolution = R_ok of Codec.payload | R_fail of string
 type event =
   | Activity_resolved of int * resolution (* seq, result *)
   | Timer_fired of int (* seq *)
+  | Signal of string * Codec.payload (* name, encoded arg *)
 
 type run_state = {
   mutable wf_name : string;
@@ -87,6 +88,23 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
   let cursor = ref (List.rev state.events_rev) in
   let peek () = match !cursor with ev :: _ -> Some ev | [] -> None in
   let advance () = match !cursor with _ :: rest -> cursor := rest | [] -> () in
+  (* signal handlers registered by the body on this run (rebuilt each re-run). *)
+  let signal_handlers : (string, Codec.payload -> unit) Hashtbl.t =
+    Hashtbl.create 8
+  in
+  (* deliver any signals at the cursor head to their handlers, advancing past
+     them, until the head is a resolution or the cursor is empty. This applies a
+     signal exactly where it sits relative to the resolutions around it. *)
+  let rec deliver_signals () =
+    match !cursor with
+    | Signal (name, payload) :: rest ->
+      cursor := rest;
+      (match Hashtbl.find_opt signal_handlers name with
+       | Some h -> h payload
+       | None -> () (* no handler registered: dropped (buffering is future work) *));
+      deliver_signals ()
+    | _ -> ()
+  in
   let arg =
     match state.init_arg with
     | Some p -> p
@@ -117,6 +135,7 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
               (fun (k : (a, unit) continuation) ->
                 incr act_seq;
                 let s = !act_seq in
+                deliver_signals ();
                 match peek () with
                 | Some (Activity_resolved (s', R_ok payload)) when s' = s ->
                   advance ();
@@ -143,6 +162,7 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
               (fun (k : (a, unit) continuation) ->
                 incr timer_seq;
                 let s = !timer_seq in
+                deliver_signals ();
                 match peek () with
                 | Some (Timer_fired s') when s' = s -> advance (); continue k ()
                 | _ ->
@@ -153,6 +173,17 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
               (fun (_ : (a, unit) continuation) ->
                 (* terminal: end this run, start a fresh one; drop the k *)
                 commands := [ Coresdk.Continue_as_new { arguments = [ new_arg ] } ])
+          | Workflow.Register_signal_handler_effect (name, handler) ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                Hashtbl.replace signal_handlers name handler;
+                continue k ())
+          | Workflow.Wait_condition_effect pred ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                deliver_signals ();
+                if pred () then continue k ()
+                else () (* condition false: suspend, emit no command *))
           | _ -> None);
     };
   List.rev !commands
@@ -172,6 +203,9 @@ let apply_job (state : run_state) = function
     state.events_rev <- Activity_resolved (seq, r) :: state.events_rev
   | Coresdk.Fire_timer { seq } ->
     state.events_rev <- Timer_fired seq :: state.events_rev
+  | Coresdk.Signal_workflow { signal_name; input } ->
+    let p = match input with p :: _ -> p | [] -> Codec.to_payload Codec.unit () in
+    state.events_rev <- Signal (signal_name, p) :: state.events_rev
   | Coresdk.Remove_from_cache | Coresdk.Other -> ()
 
 let workflow_loop (t : t) =

@@ -56,5 +56,6 @@ let () =
     |> register_workflow shipment_workflow
     |> register_workflow return_workflow
     |> register_workflow countdown_workflow
+    |> register_workflow approval_workflow
   in
   Worker.run worker

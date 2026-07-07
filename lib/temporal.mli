@@ -58,6 +58,15 @@ module Activity : sig
       codecs for its argument and result. *)
 end
 
+(** A signal: a named, typed message delivered into a running workflow. *)
+module Signal : sig
+  type 'a t
+
+  val define : name:string -> 'a Codec.t -> 'a t
+  (** [define ~name codec] declares a signal named [name] carrying an ['a]
+      argument. *)
+end
+
 (** A workflow: deterministic orchestration of activities. *)
 module Workflow : sig
   type 'input ctx
@@ -92,6 +101,16 @@ module Workflow : sig
   (** [sleep ctx seconds] durably suspends the workflow for [seconds] via a
       Temporal timer — it survives worker restarts and is deterministic on
       replay, unlike a wall-clock [Unix.sleep]. *)
+
+  val on_signal : _ ctx -> 'a Signal.t -> ('a -> unit) -> unit
+  (** [on_signal ctx signal handler] runs [handler] whenever [signal] is
+      received. The handler runs synchronously and typically mutates state the
+      body observes via {!wait_condition}. *)
+
+  val wait_condition : _ ctx -> (unit -> bool) -> unit
+  (** [wait_condition ctx pred] blocks the workflow until [pred ()] holds,
+      re-checked after each activation delivers new signals, timers, or activity
+      results. *)
 
   val continue_as_new : 'input ctx -> 'input -> 'a
   (** [continue_as_new ctx input] ends the current run and atomically starts a

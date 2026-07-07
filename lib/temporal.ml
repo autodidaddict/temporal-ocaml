@@ -29,6 +29,7 @@
 
 module Codec = Codec
 module Activity = Activity
+module Signal = Signal
 module Workflow = Workflow
 module Client = Client
 module Worker = Worker
