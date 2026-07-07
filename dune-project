@@ -7,6 +7,12 @@
  (synopsis "OCaml SDK for Temporal — sdk-core FFI scaffold")
  (description
   "Static bindings to temporalio-sdk-core via a Rust staticlib, in the style of Octez's Rust integration.")
+ (license "Apache-2.0")
+ (authors "Kevin Hoffman")
+ (maintainers "Kevin Hoffman")
+ (homepage "https://github.com/autodidaddict/temporal-ocaml")
+ (source
+  (github autodidaddict/temporal-ocaml))
  (depends
   (ocaml (>= 5.1))
   (eio (>= 1.0))
