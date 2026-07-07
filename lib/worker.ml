@@ -54,6 +54,7 @@ type run_state = {
   mutable wf_name : string;
   mutable init_arg : Codec.payload option;
   resolutions : (int, resolution) Hashtbl.t; (* activity seq -> result *)
+  fired_timers : (int, unit) Hashtbl.t; (* timer seq -> fired *)
 }
 
 let runs : (string, run_state) Hashtbl.t = Hashtbl.create 16
@@ -62,14 +63,21 @@ let get_run run_id =
   match Hashtbl.find_opt runs run_id with
   | Some s -> s
   | None ->
-    let s = { wf_name = ""; init_arg = None; resolutions = Hashtbl.create 8 } in
+    let s =
+      { wf_name = "";
+        init_arg = None;
+        resolutions = Hashtbl.create 8;
+        fired_timers = Hashtbl.create 8;
+      }
+    in
     Hashtbl.replace runs run_id s;
     s
 
 let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
     Coresdk.wf_command list =
   let commands = ref [] in
-  let seq = ref 0 in
+  let act_seq = ref 0 in
+  let timer_seq = ref 0 in
   let ctx = Workflow.{ task_queue = t.task_queue } in
   let arg =
     match state.init_arg with
@@ -95,8 +103,8 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
               { activity_type; arg; start_to_close } ->
             Some
               (fun (k : (a, unit) continuation) ->
-                incr seq;
-                let s = !seq in
+                incr act_seq;
+                let s = !act_seq in
                 match Hashtbl.find_opt state.resolutions s with
                 | Some (R_ok payload) -> continue k payload
                 | Some (R_fail msg) ->
@@ -114,6 +122,15 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) :
                         start_to_close;
                       }
                     :: !commands)
+          | Workflow.Start_timer_effect { start_to_fire } ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                incr timer_seq;
+                let s = !timer_seq in
+                if Hashtbl.mem state.fired_timers s then continue k ()
+                else
+                  commands :=
+                    Coresdk.Start_timer { seq = s; start_to_fire } :: !commands)
           | _ -> None);
     };
   List.rev !commands
@@ -131,6 +148,7 @@ let apply_job (state : run_state) = function
       | Coresdk.Other_resolution -> R_fail "unknown activity resolution"
     in
     Hashtbl.replace state.resolutions seq r
+  | Coresdk.Fire_timer { seq } -> Hashtbl.replace state.fired_timers seq ()
   | Coresdk.Remove_from_cache | Coresdk.Other -> ()
 
 let workflow_loop (t : t) =

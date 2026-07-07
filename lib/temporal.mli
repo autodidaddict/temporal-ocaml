@@ -78,6 +78,11 @@ module Workflow : sig
   (** [execute_activity ctx activity input] schedules [activity], waits for it,
       and returns its result. [start_to_close] is the activity timeout in
       seconds (default 10). *)
+
+  val sleep : ctx -> float -> unit
+  (** [sleep ctx seconds] durably suspends the workflow for [seconds] via a
+      Temporal timer — it survives worker restarts and is deterministic on
+      replay, unlike a wall-clock [Unix.sleep]. *)
 end
 
 (** A connection to a Temporal server. *)

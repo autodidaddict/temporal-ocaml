@@ -48,6 +48,13 @@ let execute_activity ?(start_to_close = 10.0) (_ : ctx)
   in
   Codec.of_payload a.Activity.output result
 
+(* sleep performs this effect; the worker emits a Start_timer command and suspends
+   the run, resuming when the matching FireTimer job arrives. *)
+type _ Effect.t += Start_timer_effect : { start_to_fire : float } -> unit Effect.t
+
+let sleep (_ : ctx) (seconds : float) : unit =
+  Effect.perform (Start_timer_effect { start_to_fire = seconds })
+
 (* registered form: run the body on the decoded init arg, return output payload *)
 type reg = { name : string; body : ctx -> Codec.payload -> Codec.payload }
 

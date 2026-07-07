@@ -31,6 +31,7 @@ type activity_resolution =
 type wf_job =
   | Initialize_workflow of { workflow_type : string; arguments : payload list }
   | Resolve_activity of { seq : int; result : activity_resolution }
+  | Fire_timer of { seq : int }
   | Remove_from_cache
   | Other
 
@@ -91,13 +92,26 @@ let decode_resolve_activity s =
   done;
   Resolve_activity { seq = !seq; result = !result }
 
-(* WorkflowActivationJob { oneof { initialize_workflow=1; resolve_activity=8; … } } *)
+(* FireTimer { seq=1 (uint32) } *)
+let decode_fire_timer s =
+  let r = Pb.Reader.create s in
+  let seq = ref 0 in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 0 -> seq := Pb.Reader.varint r
+    | _, w -> Pb.Reader.skip r w
+  done;
+  Fire_timer { seq = !seq }
+
+(* WorkflowActivationJob { oneof { initialize_workflow=1; fire_timer=2;
+   resolve_activity=8; remove_from_cache=50 } } *)
 let decode_wf_job s =
   let r = Pb.Reader.create s in
   let job = ref Other in
   while not (Pb.Reader.at_end r) do
     match Pb.Reader.key r with
     | 1, 2 -> job := decode_initialize (Pb.Reader.bytes r)
+    | 2, 2 -> job := decode_fire_timer (Pb.Reader.bytes r)
     | 8, 2 -> job := decode_resolve_activity (Pb.Reader.bytes r)
     | 50, 2 ->
       ignore (Pb.Reader.bytes r);
@@ -129,6 +143,7 @@ type wf_command =
       arguments : payload list;
       start_to_close : float; (* seconds *)
     }
+  | Start_timer of { seq : int; start_to_fire : float (* seconds *) }
   | Complete_workflow_execution of payload option
 
 (* google.protobuf.Duration { int64 seconds=1; int32 nanos=2 } *)
@@ -162,6 +177,14 @@ let encode_command = function
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 2 (Pb.Writer.contents sa);
     (* WorkflowCommand.schedule_activity = 2 *)
+    Pb.Writer.contents cmd
+  | Start_timer tm ->
+    let st = Pb.Writer.create () in
+    Pb.Writer.int st 1 tm.seq;
+    Pb.Writer.bytes st 2 (encode_duration tm.start_to_fire);
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 1 (Pb.Writer.contents st);
+    (* WorkflowCommand.start_timer = 1 *)
     Pb.Writer.contents cmd
 
 (* WorkflowActivationCompletion { run_id=1; successful=2 = Success{ commands=1 } } *)

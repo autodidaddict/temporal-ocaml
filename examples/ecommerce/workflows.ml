@@ -26,6 +26,9 @@ let order_workflow =
       let charge =
         Workflow.execute_activity ctx Activities.charge_payment (o.order_id, total)
       in
+      (* brief settle window before fulfilment — a durable Temporal timer, not a
+         wall-clock sleep, so it survives restarts and replays deterministically *)
+      Workflow.sleep ctx 1.0;
       (* later: on failure below, compensate with refund_payment (saga) *)
       let reservation =
         Workflow.execute_activity ctx Activities.reserve_inventory o.items
