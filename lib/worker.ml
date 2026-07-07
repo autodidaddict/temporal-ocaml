@@ -41,20 +41,29 @@ let register_activity (a : (_, _) Activity.t) (t : t) : t =
   { t with activities = r :: t.activities }
 
 (* ---- workflow execution ------------------------------------------------ *)
-(* We keep a small amount of per-run state (the init argument + the activity
-   results seen so far) and re-run the workflow body from the top on each
-   activation. execute_activity performs an effect: if the k-th activity is
-   already resolved we resume the body with its result; otherwise we emit a
-   Schedule_activity command and suspend (drop the continuation). This is the
-   deterministic replay model, minus persisting continuations across polls. *)
+(* We keep a small amount of per-run state (the init argument + a history-ordered
+   log of the external events seen so far) and re-run the workflow body from the
+   top on each activation. A cursor walks that log in order: execute_activity /
+   sleep consume the next matching resolution and resume the body; if the demanded
+   resolution has not arrived yet we emit the command and suspend (drop the
+   continuation). This is the deterministic replay model, minus persisting
+   continuations across polls. *)
 
 type resolution = R_ok of Codec.payload | R_fail of string
+
+(* External events the server delivers, kept in a single history-ordered log
+   rather than per-kind maps. Order is irrelevant for activities/timers (the body
+   demands them in a fixed sequence), but it is load-bearing for signals, which
+   must be delivered relative to the resolutions around them — so this log is the
+   foundation that makes ordered signal delivery possible. *)
+type event =
+  | Activity_resolved of int * resolution (* seq, result *)
+  | Timer_fired of int (* seq *)
 
 type run_state = {
   mutable wf_name : string;
   mutable init_arg : Codec.payload option;
-  resolutions : (int, resolution) Hashtbl.t; (* activity seq -> result *)
-  fired_timers : (int, unit) Hashtbl.t; (* timer seq -> fired *)
+  mutable events_rev : event list; (* history order, newest first (cons to append) *)
 }
 
 let runs : (string, run_state) Hashtbl.t = Hashtbl.create 16
@@ -63,13 +72,7 @@ let get_run run_id =
   match Hashtbl.find_opt runs run_id with
   | Some s -> s
   | None ->
-    let s =
-      { wf_name = "";
-        init_arg = None;
-        resolutions = Hashtbl.create 8;
-        fired_timers = Hashtbl.create 8;
-      }
-    in
+    let s = { wf_name = ""; init_arg = None; events_rev = [] } in
     Hashtbl.replace runs run_id s;
     s
 
@@ -78,6 +81,12 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
   let commands = ref [] in
   let act_seq = ref 0 in
   let timer_seq = ref 0 in
+  (* the replay cursor: remaining events in history order. Peek the next event;
+     advance only when the body consumes it. (When signals land, advancing past a
+     signal entry is exactly where its handler will fire.) *)
+  let cursor = ref (List.rev state.events_rev) in
+  let peek () = match !cursor with ev :: _ -> Some ev | [] -> None in
+  let advance () = match !cursor with _ :: rest -> cursor := rest | [] -> () in
   let arg =
     match state.init_arg with
     | Some p -> p
@@ -108,11 +117,14 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
               (fun (k : (a, unit) continuation) ->
                 incr act_seq;
                 let s = !act_seq in
-                match Hashtbl.find_opt state.resolutions s with
-                | Some (R_ok payload) -> continue k payload
-                | Some (R_fail msg) ->
+                match peek () with
+                | Some (Activity_resolved (s', R_ok payload)) when s' = s ->
+                  advance ();
+                  continue k payload
+                | Some (Activity_resolved (s', R_fail msg)) when s' = s ->
+                  advance ();
                   discontinue k (Failure ("activity failed: " ^ msg))
-                | None ->
+                | _ ->
                   (* not resolved yet: schedule it and suspend this run *)
                   commands :=
                     Coresdk.Schedule_activity
@@ -131,8 +143,9 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
               (fun (k : (a, unit) continuation) ->
                 incr timer_seq;
                 let s = !timer_seq in
-                if Hashtbl.mem state.fired_timers s then continue k ()
-                else
+                match peek () with
+                | Some (Timer_fired s') when s' = s -> advance (); continue k ()
+                | _ ->
                   commands :=
                     Coresdk.Start_timer { seq = s; start_to_fire } :: !commands)
           | Workflow.Continue_as_new_effect new_arg ->
@@ -156,8 +169,9 @@ let apply_job (state : run_state) = function
       | Coresdk.Failed msg -> R_fail msg
       | Coresdk.Other_resolution -> R_fail "unknown activity resolution"
     in
-    Hashtbl.replace state.resolutions seq r
-  | Coresdk.Fire_timer { seq } -> Hashtbl.replace state.fired_timers seq ()
+    state.events_rev <- Activity_resolved (seq, r) :: state.events_rev
+  | Coresdk.Fire_timer { seq } ->
+    state.events_rev <- Timer_fired seq :: state.events_rev
   | Coresdk.Remove_from_cache | Coresdk.Other -> ()
 
 let workflow_loop (t : t) =
