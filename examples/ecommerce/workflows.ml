@@ -20,7 +20,8 @@ open Temporal
 open Model
 
 let order_workflow =
-  Workflow.define ~name:"OrderWorkflow" (fun ctx (o : order) ->
+  Workflow.define ~name:"OrderWorkflow" ~input:order_codec ~output:Codec.string
+    (fun ctx (o : order) ->
       let total = Workflow.execute_activity ctx Activities.validate_order o in
       let charge =
         Workflow.execute_activity ctx Activities.charge_payment (o.order_id, total)
@@ -39,6 +40,8 @@ let order_workflow =
 
 let shipment_workflow =
   Workflow.define ~name:"ShipmentWorkflow"
+    ~input:Codec.(pair (list line_item_codec) string)
+    ~output:Codec.string
     (fun ctx ((items, ship_to) : line_item list * string) ->
       let package = Workflow.execute_activity ctx Activities.pick_and_pack items in
       let tracking =
@@ -48,7 +51,9 @@ let shipment_workflow =
       Workflow.execute_activity ctx Activities.confirm_delivery tracking)
 
 let return_workflow =
-  Workflow.define ~name:"ReturnWorkflow" (fun ctx (r : return_request) ->
+  Workflow.define ~name:"ReturnWorkflow" ~input:return_request_codec
+    ~output:Codec.string
+    (fun ctx (r : return_request) ->
       let rma =
         Workflow.execute_activity ctx Activities.authorize_return r.return_order
       in

@@ -31,6 +31,7 @@ type activity_resolution =
 type wf_job =
   | Initialize_workflow of { workflow_type : string; arguments : payload list }
   | Resolve_activity of { seq : int; result : activity_resolution }
+  | Remove_from_cache
   | Other
 
 type wf_activation = { run_id : string; jobs : wf_job list }
@@ -98,6 +99,9 @@ let decode_wf_job s =
     match Pb.Reader.key r with
     | 1, 2 -> job := decode_initialize (Pb.Reader.bytes r)
     | 8, 2 -> job := decode_resolve_activity (Pb.Reader.bytes r)
+    | 50, 2 ->
+      ignore (Pb.Reader.bytes r);
+      job := Remove_from_cache (* remove_from_cache = 50 *)
     | _, w -> Pb.Reader.skip r w
   done;
   !job

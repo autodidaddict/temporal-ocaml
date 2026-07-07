@@ -48,8 +48,14 @@ end
 module Activity : sig
   type ('input, 'output) t
 
-  val define : name:string -> ('input -> 'output) -> ('input, 'output) t
-  (** [define ~name f] declares an activity called [name], implemented by [f]. *)
+  val define :
+    name:string ->
+    input:'input Codec.t ->
+    output:'output Codec.t ->
+    ('input -> 'output) ->
+    ('input, 'output) t
+  (** [define ~name ~input ~output f] declares an activity called [name], with
+      codecs for its argument and result. *)
 end
 
 (** A workflow: deterministic orchestration of activities. *)
@@ -60,12 +66,18 @@ module Workflow : sig
   type ('input, 'output) t
 
   val define :
-    name:string -> (ctx -> 'input -> 'output) -> ('input, 'output) t
-  (** [define ~name f] declares a workflow called [name], implemented by [f]. *)
+    name:string ->
+    input:'input Codec.t ->
+    output:'output Codec.t ->
+    (ctx -> 'input -> 'output) ->
+    ('input, 'output) t
+  (** [define ~name ~input ~output f] declares a workflow called [name]. *)
 
-  val execute_activity : ctx -> ('i, 'o) Activity.t -> 'i -> 'o
-  (** [execute_activity ctx activity input] runs [activity] and returns its
-      result. *)
+  val execute_activity :
+    ?start_to_close:float -> ctx -> ('i, 'o) Activity.t -> 'i -> 'o
+  (** [execute_activity ctx activity input] schedules [activity], waits for it,
+      and returns its result. [start_to_close] is the activity timeout in
+      seconds (default 10). *)
 end
 
 (** A connection to a Temporal server. *)

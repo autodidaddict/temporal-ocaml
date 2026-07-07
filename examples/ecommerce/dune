@@ -1,4 +1,4 @@
 ; E-commerce example worker. Modules: Model, Activities, Workflows, Main.
 (executable
  (name main)
- (libraries temporal eio_main))
+ (libraries temporal eio_main yojson))
