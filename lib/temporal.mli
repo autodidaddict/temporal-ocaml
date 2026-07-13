@@ -173,6 +173,15 @@ module Workflow : sig
 
   val history_length : _ ctx -> int
   (** Number of events in this run's history so far. Deterministic on replay. *)
+
+  val workflow_id : _ ctx -> string
+  (** This execution's workflow id. Stable across replay and across
+      continue-as-new, so it is safe to branch on or to derive deterministic
+      values from (e.g. a child workflow id). *)
+
+  val run_id : _ ctx -> string
+  (** This run's id. Stable across replay; a fresh run id is assigned on each
+      continue-as-new. Deterministic on replay. *)
 end
 
 (** A connection to a Temporal server. *)

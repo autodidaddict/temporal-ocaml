@@ -29,7 +29,11 @@ type activity_resolution =
   | Other_resolution
 
 type wf_job =
-  | Initialize_workflow of { workflow_type : string; arguments : payload list }
+  | Initialize_workflow of {
+      workflow_type : string;
+      workflow_id : string;
+      arguments : payload list;
+    }
   | Resolve_activity of { seq : int; result : activity_resolution }
   | Fire_timer of { seq : int }
   | Signal_workflow of { signal_name : string; input : payload list }
@@ -103,17 +107,20 @@ let decode_activity_resolution s =
   done;
   !res
 
-(* InitializeWorkflow { workflow_type=1; arguments=3 (repeated Payload) } *)
+(* InitializeWorkflow { workflow_type=1; workflow_id=2; arguments=3 (repeated
+   Payload) } *)
 let decode_initialize s =
   let r = Pb.Reader.create s in
-  let wt = ref "" and args = ref [] in
+  let wt = ref "" and wid = ref "" and args = ref [] in
   while not (Pb.Reader.at_end r) do
     match Pb.Reader.key r with
     | 1, 2 -> wt := Pb.Reader.bytes r
+    | 2, 2 -> wid := Pb.Reader.bytes r
     | 3, 2 -> args := decode_payloads_field r !args
     | _, w -> Pb.Reader.skip r w
   done;
-  Initialize_workflow { workflow_type = !wt; arguments = List.rev !args }
+  Initialize_workflow
+    { workflow_type = !wt; workflow_id = !wid; arguments = List.rev !args }
 
 (* ResolveActivity { seq=1 (uint32); result=2 (ActivityResolution) } *)
 let decode_resolve_activity s =

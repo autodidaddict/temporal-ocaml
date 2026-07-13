@@ -71,6 +71,7 @@ type event =
 
 type run_state = {
   mutable wf_name : string;
+  mutable wf_id : string; (* this execution's workflow id, from InitializeWorkflow *)
   mutable init_arg : Codec.payload option;
   mutable events_rev : event list; (* history order, newest first (cons to append) *)
 }
@@ -81,7 +82,7 @@ let get_run run_id =
   match Hashtbl.find_opt runs run_id with
   | Some s -> s
   | None ->
-    let s = { wf_name = ""; init_arg = None; events_rev = [] } in
+    let s = { wf_name = ""; wf_id = ""; init_arg = None; events_rev = [] } in
     Hashtbl.replace runs run_id s;
     s
 
@@ -93,8 +94,9 @@ let get_run run_id =
    workflow-advancing command, so it neither re-schedules the frontier's pending
    effect nor re-completes an already-finished run. Queries are answered, and
    updates validated/run and responded to, from the handlers the body registers. *)
-let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
-    ~history_length ~query_mode ~queries ~updates : Coresdk.wf_command list =
+let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~run_id
+    ~can_suggested ~history_length ~query_mode ~queries ~updates :
+    Coresdk.wf_command list =
   let commands = ref [] in
   let act_seq = ref 0 in
   let timer_seq = ref 0 in
@@ -202,7 +204,8 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
   let open Effect.Deep in
   match_with
     (fun () ->
-      wf.Workflow.body ~task_queue:t.task_queue ~can_suggested ~history_length arg)
+      wf.Workflow.body ~task_queue:t.task_queue ~workflow_id:state.wf_id ~run_id
+        ~can_suggested ~history_length arg)
     ()
     {
       retc =
@@ -377,8 +380,9 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
   List.rev !commands @ query_commands @ update_commands
 
 let apply_job (state : run_state) = function
-  | Coresdk.Initialize_workflow { workflow_type; arguments } ->
+  | Coresdk.Initialize_workflow { workflow_type; workflow_id; arguments } ->
     state.wf_name <- workflow_type;
+    state.wf_id <- workflow_id;
     state.init_arg <- (match arguments with p :: _ -> Some p | [] -> None)
   | Coresdk.Resolve_activity { seq; result } ->
     let r =
@@ -467,7 +471,7 @@ let workflow_loop (t : t) =
               t.workflows
           with
           | Some wf ->
-            run_workflow t wf state
+            run_workflow t wf state ~run_id:a.Coresdk.run_id
               ~can_suggested:a.Coresdk.continue_as_new_suggested
               ~history_length:a.Coresdk.history_length ~query_mode ~queries ~updates
           | None ->

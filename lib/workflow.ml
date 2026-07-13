@@ -17,6 +17,8 @@
 
 type 'input ctx = {
   task_queue : string;
+  workflow_id : string; (* this execution's workflow id (stable across replay) *)
+  run_id : string; (* this run's id (a fresh one per continue-as-new) *)
   continue_as_new_suggested : bool; (* this activation *)
   history_length : int; (* events in this run's history so far *)
   encode_input : 'input -> Codec.payload; (* the workflow's own input codec *)
@@ -74,6 +76,12 @@ let continue_as_new (ctx : 'i ctx) (new_input : 'i) : 'a =
    both signals are deterministic on replay, so branching on them is safe. *)
 let continue_as_new_suggested (ctx : _ ctx) : bool = ctx.continue_as_new_suggested
 let history_length (ctx : _ ctx) : int = ctx.history_length
+
+(* this execution's ids. Both are stable across replay (the run id changes only on
+   continue-as-new, which starts a new run), so they are safe to read and to derive
+   deterministic values from — e.g. a child workflow id. *)
+let workflow_id (ctx : _ ctx) : string = ctx.workflow_id
+let run_id (ctx : _ ctx) : string = ctx.run_id
 
 (* on_signal registers a handler (the signal's decoder composed with the user's
    callback); the worker fires it as the replay cursor passes a matching signal
@@ -138,6 +146,8 @@ type reg = {
   name : string;
   body :
     task_queue:string ->
+    workflow_id:string ->
+    run_id:string ->
     can_suggested:bool ->
     history_length:int ->
     Codec.payload ->
@@ -147,9 +157,11 @@ type reg = {
 let reg (t : (_, _) t) =
   { name = t.name;
     body =
-      (fun ~task_queue ~can_suggested ~history_length p ->
+      (fun ~task_queue ~workflow_id ~run_id ~can_suggested ~history_length p ->
         let ctx =
           { task_queue;
+            workflow_id;
+            run_id;
             continue_as_new_suggested = can_suggested;
             history_length;
             encode_input = Codec.to_payload t.input;
