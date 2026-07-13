@@ -97,3 +97,19 @@ let approval_workflow =
       match !decision with None -> "pending" | Some d -> d);
   wait_condition ctx (fun () -> !decision <> None);
   Printf.sprintf "%s -> %s" subject (Option.get !decision)
+
+(* Demonstrates signal buffering: the handler is registered only AFTER a durable
+   timer, so a "resume" signal sent while the timer runs arrives before any handler
+   exists. Temporal buffers it and delivers it when on_signal registers below —
+   without buffering it would be dropped and the wait_condition would hang. *)
+let resume = Signal.define ~name:"resume" Codec.string
+
+let buffered_signal_workflow =
+  Workflow.define ~name:"BufferedSignalWorkflow" ~input:Codec.string
+    ~output:Codec.string
+  @@ fun ctx (label : string) ->
+  sleep ctx 3.0;
+  let payload = ref None in
+  on_signal ctx resume (fun m -> payload := Some m);
+  wait_condition ctx (fun () -> !payload <> None);
+  Printf.sprintf "%s resumed with %s" label (Option.get !payload)

@@ -189,6 +189,19 @@ case "$st" in *COMPLETED) pass "queried workflow COMPLETED after approve" ;; *) 
 q2="$(query smoke-query status)"
 case "$q2" in *approved*) pass "query after close -> approved" ;; *) fail "closed query: $q2" ;; esac
 
+# ---- scenario 7: signal buffering ---------------------------------------------
+log "scenario 7: signal buffered until its handler is registered"
+# the workflow sleeps on a durable timer before registering its handler; send the
+# signal during that window so it lands before any handler exists. Without
+# buffering the signal is dropped and the workflow hangs (never COMPLETED).
+start_wf smoke-buffer BufferedSignalWorkflow '"batch-7"'
+sleep 1
+temporal workflow signal --workflow-id smoke-buffer --name resume --input '"payload-7"' >/dev/null 2>&1
+st="$(await_terminal smoke-buffer)"
+case "$st" in *COMPLETED) pass "buffered-signal workflow COMPLETED" ;; *) fail "buffer status: $st" ;; esac
+res="$(result smoke-buffer)"
+case "$res" in *"batch-7 resumed with payload-7"*) pass "signal delivered after late handler registration" ;; *) fail "buffer result: $res" ;; esac
+
 # ---- summary ------------------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then

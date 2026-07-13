@@ -103,16 +103,36 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
   let query_handlers : (string, Codec.payload -> Codec.payload) Hashtbl.t =
     Hashtbl.create 8
   in
+  (* signals the cursor passed before their handler was registered, held per name
+     in arrival order and drained when on_signal registers a matching handler.
+     Matches Temporal, which buffers signals until a handler exists. In the normal
+     case handlers are registered at the top of the body, before any checkpoint, so
+     nothing is ever buffered. *)
+  let buffered_signals : (string, Codec.payload Queue.t) Hashtbl.t =
+    Hashtbl.create 4
+  in
+  let buffer_signal name payload =
+    let q =
+      match Hashtbl.find_opt buffered_signals name with
+      | Some q -> q
+      | None ->
+        let q = Queue.create () in
+        Hashtbl.replace buffered_signals name q;
+        q
+    in
+    Queue.add payload q
+  in
   (* deliver any signals at the cursor head to their handlers, advancing past
      them, until the head is a resolution or the cursor is empty. This applies a
-     signal exactly where it sits relative to the resolutions around it. *)
+     signal exactly where it sits relative to the resolutions around it. A signal
+     whose handler isn't registered yet is buffered, not dropped. *)
   let rec deliver_signals () =
     match !cursor with
     | Signal (name, payload) :: rest ->
       cursor := rest;
       (match Hashtbl.find_opt signal_handlers name with
        | Some h -> h payload
-       | None -> () (* no handler registered: dropped (buffering is future work) *));
+       | None -> buffer_signal name payload);
       deliver_signals ()
     | _ -> ()
   in
@@ -200,6 +220,13 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
             Some
               (fun (k : (a, unit) continuation) ->
                 Hashtbl.replace signal_handlers name handler;
+                (* deliver any signals that arrived before this handler existed,
+                   in arrival order, then discard the buffer for this name *)
+                (match Hashtbl.find_opt buffered_signals name with
+                 | Some q ->
+                   Queue.iter handler q;
+                   Hashtbl.remove buffered_signals name
+                 | None -> ());
                 continue k ())
           | Workflow.Register_query_handler_effect (name, handler) ->
             Some
