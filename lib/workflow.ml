@@ -112,6 +112,26 @@ let on_query (_ : _ ctx) (q : ('a, 'b) Query.t) (handler : 'a -> 'b) : unit =
            Codec.to_payload q.Query.output (handler (Codec.of_payload q.Query.input p))
        ))
 
+(* on_update registers a handler (and optional validator) for an update. The
+   worker runs the validator (if [validate] is given and core asks for it) to
+   accept or reject, then fires the handler as the replay cursor passes the
+   admitted update — mutating state like a signal and producing a result like a
+   query. Both are erased to payload functions: a validator raises to reject. *)
+type _ Effect.t +=
+  | Register_update_handler_effect :
+      string
+      * (Codec.payload -> unit) option (* validator: raise to reject *)
+      * (Codec.payload -> Codec.payload) (* handler: mutate state, return result *)
+      -> unit Effect.t
+
+let on_update (_ : _ ctx) (u : ('a, 'b) Update.t) ?(validate : ('a -> unit) option)
+    (handle : 'a -> 'b) : unit =
+  let decode = Codec.of_payload u.Update.input in
+  let validator = Option.map (fun v p -> v (decode p)) validate in
+  let handler p = Codec.to_payload u.Update.output (handle (decode p)) in
+  Effect.perform
+    (Register_update_handler_effect (u.Update.name, validator, handler))
+
 (* registered form: builds the typed ctx (carrying the workflow's own input
    encoder) from the per-activation runtime info, then runs the body. *)
 type reg = {

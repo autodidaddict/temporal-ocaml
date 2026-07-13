@@ -58,5 +58,6 @@ let () =
     |> register_workflow countdown_workflow
     |> register_workflow approval_workflow
     |> register_workflow buffered_signal_workflow
+    |> register_workflow account_workflow
   in
   Worker.run worker

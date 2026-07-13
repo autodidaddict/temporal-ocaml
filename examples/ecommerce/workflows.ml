@@ -113,3 +113,26 @@ let buffered_signal_workflow =
   on_signal ctx resume (fun m -> payload := Some m);
   wait_condition ctx (fun () -> !payload <> None);
   Printf.sprintf "%s resumed with %s" label (Option.get !payload)
+
+(* Demonstrates updates: [deposit] both mutates state and returns a value, gated by
+   a validator that rejects non-positive amounts before the update is admitted. A
+   [balance] query reads the same state; a [close] signal ends the workflow. *)
+let deposit = Update.define ~name:"deposit" ~input:Codec.int ~output:Codec.int
+let close = Signal.define ~name:"close" Codec.unit
+let balance_query = Query.define ~name:"balance" ~input:Codec.unit ~output:Codec.int
+
+let account_workflow =
+  Workflow.define ~name:"AccountWorkflow" ~input:Codec.int ~output:Codec.int
+  @@ fun ctx (opening : int) ->
+  let balance = ref opening in
+  let closed = ref false in
+  on_update ctx deposit
+    ~validate:(fun amount ->
+      if amount <= 0 then failwith "deposit amount must be positive")
+    (fun amount ->
+      balance := !balance + amount;
+      !balance);
+  on_signal ctx close (fun () -> closed := true);
+  on_query ctx balance_query (fun () -> !balance);
+  wait_condition ctx (fun () -> !closed);
+  !balance

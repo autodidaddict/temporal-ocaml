@@ -120,6 +120,18 @@ if isinstance(r, list) and r:
     print(v if isinstance(v, str) else json.dumps(v))
 ' 2>/dev/null
 }
+update() { # id name input -> decoded update result (empty if not accepted)
+  temporal workflow update execute --workflow-id "$1" --name "$2" --input "$3" --output json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+r = d.get("result")
+if r is not None:
+    print(r if isinstance(r, str) else json.dumps(r))
+' 2>/dev/null
+}
 
 # ---- scenario 1 + 2: happy path with a durable timer --------------------------
 log "scenario 1+2: happy path + durable timer"
@@ -201,6 +213,27 @@ st="$(await_terminal smoke-buffer)"
 case "$st" in *COMPLETED) pass "buffered-signal workflow COMPLETED" ;; *) fail "buffer status: $st" ;; esac
 res="$(result smoke-buffer)"
 case "$res" in *"batch-7 resumed with payload-7"*) pass "signal delivered after late handler registration" ;; *) fail "buffer result: $res" ;; esac
+
+# ---- scenario 8: updates ------------------------------------------------------
+log "scenario 8: update mutates state, returns a value, and is validator-gated"
+start_wf smoke-acct AccountWorkflow '100'
+sleep 2
+d1="$(update smoke-acct deposit 50)"
+case "$d1" in *150*) pass "update deposit 50 -> 150" ;; *) fail "deposit1: $d1" ;; esac
+d2="$(update smoke-acct deposit 25)"
+case "$d2" in *175*) pass "second update -> 175 (state accumulates)" ;; *) fail "deposit2: $d2" ;; esac
+# the validator rejects a non-positive deposit (CLI exits non-zero with the message)
+rej="$(temporal workflow update execute --workflow-id smoke-acct --name deposit --input '-5' 2>&1)"
+case "$rej" in *positive*) pass "validator rejected negative deposit" ;; *) fail "rejection: $rej" ;; esac
+# the query reflects update-mutated state, unchanged by the rejected update
+qb="$(query smoke-acct balance)"
+case "$qb" in *175*) pass "query balance -> 175 (rejected update mutated nothing)" ;; *) fail "balance query: $qb" ;; esac
+# a close signal ends the workflow with the final balance
+temporal workflow signal --workflow-id smoke-acct --name close >/dev/null 2>&1
+st="$(await_terminal smoke-acct)"
+case "$st" in *COMPLETED) pass "account workflow COMPLETED" ;; *) fail "account status: $st" ;; esac
+res="$(result smoke-acct)"
+case "$res" in *175*) pass "final balance 175" ;; *) fail "account result: $res" ;; esac
 
 # ---- summary ------------------------------------------------------------------
 echo

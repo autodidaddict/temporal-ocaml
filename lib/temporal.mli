@@ -82,6 +82,20 @@ module Query : sig
       common no-argument query. *)
 end
 
+(** An update: a request that both mutates workflow state (like a signal) and
+    returns a value (like a query), optionally gated by a validator. *)
+module Update : sig
+  type ('input, 'output) t
+
+  val define :
+    name:string ->
+    input:'input Codec.t ->
+    output:'output Codec.t ->
+    ('input, 'output) t
+  (** [define ~name ~input ~output] declares an update named [name] taking an
+      ['input] argument and returning an ['output]. *)
+end
+
 (** A workflow: deterministic orchestration of activities. *)
 module Workflow : sig
   type 'input ctx
@@ -129,6 +143,17 @@ module Workflow : sig
       arrives, after the body has replayed to its current frontier, and its
       result is returned to the caller. A query with no registered handler
       answers with an error. *)
+
+  val on_update :
+    _ ctx -> ('a, 'b) Update.t -> ?validate:('a -> unit) -> ('a -> 'b) -> unit
+  (** [on_update ctx update ?validate handle] registers [handle] for [update].
+      [handle] runs when the update is delivered — it may mutate body state
+      (which a subsequent {!wait_condition} observes) and returns a result sent
+      back to the caller. If [validate] is given it runs first, on the update's
+      first delivery only, and rejects the update by raising: a rejected update
+      is not admitted, mutates nothing, and returns the failure to the caller.
+      Like signal and query handlers, both run synchronously — they must not run
+      activities, sleep, or continue-as-new. *)
 
   val wait_condition : _ ctx -> (unit -> bool) -> unit
   (** [wait_condition ctx pred] blocks the workflow until [pred ()] holds,

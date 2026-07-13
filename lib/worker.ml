@@ -60,6 +60,14 @@ type event =
   | Activity_resolved of int * resolution (* seq, result *)
   | Timer_fired of int (* seq *)
   | Signal of string * Codec.payload (* name, encoded arg *)
+  | Update of {
+      protocol_instance_id : string; (* correlates the UpdateResponse(s) *)
+      name : string;
+      input : Codec.payload;
+    }
+    (* an admitted update: order-sensitive like a signal, delivered by the same
+       cursor walk. Kept in the log so its state mutation replays; the accept/
+       reject decision and the response are per-activation, not stored here. *)
 
 type run_state = {
   mutable wf_name : string;
@@ -77,14 +85,16 @@ let get_run run_id =
     Hashtbl.replace runs run_id s;
     s
 
-(* [queries] are the (query_id, query_type, arguments) of any QueryWorkflow jobs
-   on this activation. When [query_mode] is set (a pure-query activation), the body
-   is replayed read-only: it rebuilds state from history but suppresses every
+(* [queries] are the (query_id, query_type, arguments) of any QueryWorkflow jobs,
+   and [updates] the (protocol_instance_id, run_validator) of any DoUpdate jobs, on
+   this activation (whose Update events apply_job already appended to the log, in
+   job order). When [query_mode] is set (a pure-query activation), the body is
+   replayed read-only: it rebuilds state from history but suppresses every
    workflow-advancing command, so it neither re-schedules the frontier's pending
-   effect nor re-completes an already-finished run. Queries are answered from the
-   handlers the body registers, in either mode. *)
+   effect nor re-completes an already-finished run. Queries are answered, and
+   updates validated/run and responded to, from the handlers the body registers. *)
 let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
-    ~history_length ~query_mode ~queries : Coresdk.wf_command list =
+    ~history_length ~query_mode ~queries ~updates : Coresdk.wf_command list =
   let commands = ref [] in
   let act_seq = ref 0 in
   let timer_seq = ref 0 in
@@ -122,18 +132,66 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
     in
     Queue.add payload q
   in
-  (* deliver any signals at the cursor head to their handlers, advancing past
-     them, until the head is a resolution or the cursor is empty. This applies a
-     signal exactly where it sits relative to the resolutions around it. A signal
-     whose handler isn't registered yet is buffered, not dropped. *)
-  let rec deliver_signals () =
+  (* update handlers registered by the body on this run: name -> (validator?,
+     handler). Delivering an update runs the validator (only on first delivery,
+     i.e. pid in validate_pids) then the handler, recording the per-update outcome
+     below so the UpdateResponse(s) can be emitted after the replay. *)
+  let update_handlers :
+      (string, (Codec.payload -> unit) option * (Codec.payload -> Codec.payload))
+      Hashtbl.t =
+    Hashtbl.create 4
+  in
+  let validate_pids : (string, unit) Hashtbl.t = Hashtbl.create 4 in
+  List.iter
+    (fun (pid, run_validator) ->
+      if run_validator then Hashtbl.replace validate_pids pid ())
+    updates;
+  let update_accepted : (string, unit) Hashtbl.t = Hashtbl.create 4 in
+  let update_results : (string, Codec.payload) Hashtbl.t = Hashtbl.create 4 in
+  let update_failed : (string, string) Hashtbl.t = Hashtbl.create 4 in
+  let deliver_update pid name input =
+    match Hashtbl.find_opt update_handlers name with
+    | None ->
+      Hashtbl.replace update_failed pid
+        (Printf.sprintf "no update handler registered for %S" name)
+    | Some (validator, handler) ->
+      (* validate only on first delivery; a raising validator rejects, and the
+         handler never runs. Otherwise the update is accepted. *)
+      let rejected =
+        Hashtbl.mem validate_pids pid
+        &&
+        match validator with
+        | Some v -> (
+          try
+            v input;
+            false
+          with e ->
+            Hashtbl.replace update_failed pid (Printexc.to_string e);
+            true)
+        | None -> false
+      in
+      if not rejected then (
+        Hashtbl.replace update_accepted pid ();
+        (* a handler that raises after acceptance fails the update, not the run *)
+        try Hashtbl.replace update_results pid (handler input)
+        with e -> Hashtbl.replace update_failed pid (Printexc.to_string e))
+  in
+  (* deliver signals and updates at the cursor head, advancing past each, until the
+     head is a resolution or the cursor is empty — applying each exactly where it
+     sits relative to the resolutions around it. A signal whose handler isn't
+     registered yet is buffered, not dropped. *)
+  let rec deliver_pending () =
     match !cursor with
     | Signal (name, payload) :: rest ->
       cursor := rest;
       (match Hashtbl.find_opt signal_handlers name with
        | Some h -> h payload
        | None -> buffer_signal name payload);
-      deliver_signals ()
+      deliver_pending ()
+    | Update { protocol_instance_id; name; input } :: rest ->
+      cursor := rest;
+      deliver_update protocol_instance_id name input;
+      deliver_pending ()
     | _ -> ()
   in
   let arg =
@@ -171,7 +229,7 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
               (fun (k : (a, unit) continuation) ->
                 incr act_seq;
                 let s = !act_seq in
-                deliver_signals ();
+                deliver_pending ();
                 match peek () with
                 | Some (Activity_resolved (s', R_ok payload)) when s' = s ->
                   advance ();
@@ -201,7 +259,7 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
               (fun (k : (a, unit) continuation) ->
                 incr timer_seq;
                 let s = !timer_seq in
-                deliver_signals ();
+                deliver_pending ();
                 match peek () with
                 | Some (Timer_fired s') when s' = s -> advance (); continue k ()
                 | _ ->
@@ -233,14 +291,24 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
               (fun (k : (a, unit) continuation) ->
                 Hashtbl.replace query_handlers name handler;
                 continue k ())
+          | Workflow.Register_update_handler_effect (name, validator, handler) ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                Hashtbl.replace update_handlers name (validator, handler);
+                continue k ())
           | Workflow.Wait_condition_effect pred ->
             Some
               (fun (k : (a, unit) continuation) ->
-                deliver_signals ();
+                deliver_pending ();
                 if pred () then continue k ()
                 else () (* condition false: suspend, emit no command *))
           | _ -> None);
     };
+  (* flush any signals/updates still at the frontier that no checkpoint reached
+     (e.g. the body completed without a trailing wait_condition) so an arrived
+     update always gets a response. Already-delivered events were advanced past, so
+     this only fires stragglers. *)
+  deliver_pending ();
   (* answer each query on this activation from the handlers the body registered as
      it replayed to its frontier. A missing or raising handler answers with a
      failure rather than failing the workflow. *)
@@ -264,7 +332,49 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
         Coresdk.Respond_to_query { query_id; result })
       queries
   in
-  List.rev !commands @ query_commands
+  (* emit the UpdateResponse(s) for updates that arrived this activation: accepted
+     then completed on success; accepted then rejected if the handler raised after
+     acceptance; a lone rejected if the validator rejected. *)
+  let update_response pid outcome =
+    Coresdk.Update_response { protocol_instance_id = pid; outcome }
+  in
+  let update_commands =
+    List.concat_map
+      (fun (pid, _run_validator) ->
+        if Hashtbl.mem update_accepted pid then
+          let accepted = update_response pid Coresdk.Update_accepted in
+          match Hashtbl.find_opt update_results pid with
+          | Some result ->
+            [ accepted; update_response pid (Coresdk.Update_completed result) ]
+          | None ->
+            let msg =
+              match Hashtbl.find_opt update_failed pid with
+              | Some m -> m
+              | None -> "update handler did not complete"
+            in
+            [ accepted; update_response pid (Coresdk.Update_rejected msg) ]
+        else
+          let msg =
+            match Hashtbl.find_opt update_failed pid with
+            | Some m -> m
+            | None -> "update rejected"
+          in
+          [ update_response pid (Coresdk.Update_rejected msg) ])
+      updates
+  in
+  (* a rejected update was never admitted to history, so drop its event to keep the
+     log consistent with what core replays after an eviction. *)
+  List.iter
+    (fun (pid, _) ->
+      if not (Hashtbl.mem update_accepted pid) then
+        state.events_rev <-
+          List.filter
+            (function
+              | Update u -> u.protocol_instance_id <> pid
+              | _ -> true)
+            state.events_rev)
+    updates;
+  List.rev !commands @ query_commands @ update_commands
 
 let apply_job (state : run_state) = function
   | Coresdk.Initialize_workflow { workflow_type; arguments } ->
@@ -290,13 +400,13 @@ let apply_job (state : run_state) = function
        Respond_to_query) is handled separately from history application and is
        the next runtime increment; for now the job is decoded but not served. *)
     ()
-  | Coresdk.Do_update _ ->
-    (* An update is an order-sensitive event (mutates state like a signal) that
-       also returns a value (like a query) and may be gated by a validator.
-       Admitting it to the event log, running the validator, firing the handler,
-       and emitting the UpdateResponse(s) is the next runtime increment; for now
-       the job is decoded but not served. *)
-    ()
+  | Coresdk.Do_update { protocol_instance_id; name; input; run_validator = _ } ->
+    (* admit the update to the log in job order, like a signal; the validator gate
+       and the UpdateResponse are handled per-activation in run_workflow, which
+       drops the event again if the validator rejects it. *)
+    let p = match input with p :: _ -> p | [] -> Codec.to_payload Codec.unit () in
+    state.events_rev <-
+      Update { protocol_instance_id; name; input = p } :: state.events_rev
   | Coresdk.Remove_from_cache | Coresdk.Other -> ()
 
 let workflow_loop (t : t) =
@@ -335,6 +445,17 @@ let workflow_loop (t : t) =
                   | _ -> true)
                 a.Coresdk.jobs)
       in
+      (* DoUpdate jobs, as (protocol_instance_id, run_validator); their Update
+         events were appended by apply_job above. run_validator is true only on
+         first delivery. *)
+      let updates =
+        List.filter_map
+          (function
+            | Coresdk.Do_update { protocol_instance_id; run_validator; _ } ->
+              Some (protocol_instance_id, run_validator)
+            | _ -> None)
+          a.Coresdk.jobs
+      in
       let commands =
         if evict then (
           Hashtbl.remove runs a.Coresdk.run_id;
@@ -348,7 +469,7 @@ let workflow_loop (t : t) =
           | Some wf ->
             run_workflow t wf state
               ~can_suggested:a.Coresdk.continue_as_new_suggested
-              ~history_length:a.Coresdk.history_length ~query_mode ~queries
+              ~history_length:a.Coresdk.history_length ~query_mode ~queries ~updates
           | None ->
             Eio.traceln "[wf] no workflow registered as %S" state.wf_name;
             []
