@@ -141,13 +141,21 @@ st="$(await_terminal smoke-ok)"
 case "$st" in *COMPLETED) pass "happy path COMPLETED" ;; *) fail "happy path status: $st" ;; esac
 res="$(result smoke-ok)"
 case "$res" in
-  *"charged ch_o-1_4200, reserved rsv_WIDGET-GADGET, shipment shp_o-1"*) pass "composed result value" ;;
+  *"charged ch_o-1_4200, reserved rsv_WIDGET-GADGET, shipment delivered:1Z_pkg_2_items"*) pass "composed result value (shipment from child)" ;;
   *) fail "unexpected result: $res" ;;
 esac
 case "$(has_events smoke-ok TIMER_STARTED TIMER_FIRED)" in
   yes) pass "durable timer started and fired" ;;
   *)   fail "timer events missing from history" ;;
 esac
+# ShipmentWorkflow ran as a child: its start+completion appear in the parent's
+# history, and it exists as its own execution under the derived id.
+case "$(has_events smoke-ok CHILD_WORKFLOW_EXECUTION_STARTED CHILD_WORKFLOW_EXECUTION_COMPLETED)" in
+  yes) pass "child workflow started and completed in parent history" ;;
+  *)   fail "child workflow events missing from parent history" ;;
+esac
+cst="$(await_terminal 'smoke-ok/1')"
+case "$cst" in *COMPLETED) pass "child completed as its own execution (id smoke-ok/1)" ;; *) fail "child status: $cst" ;; esac
 
 # ---- scenario 3: activity failure fails the workflow --------------------------
 log "scenario 3: activity failure -> workflow FAILED"

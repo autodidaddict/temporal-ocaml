@@ -56,6 +56,51 @@ let execute_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : _ ctx)
   in
   Codec.of_payload a.Activity.output result
 
+(* What happens to a running child when the parent closes. *)
+type parent_close_policy = Terminate | Abandon | Request_cancel
+
+(* execute_child_workflow starts another workflow as a child and waits for its
+   result. The worker resolves it from the child's two history resolutions (start,
+   then completion) or, the first time, emits a Start_child_workflow_execution
+   command and suspends. The child is named/typed by its own [Workflow.t], so the
+   codecs come for free. A [None] workflow_id/task_queue lets the worker default
+   them (deterministic id from the parent id + seq; the parent's task queue). *)
+type _ Effect.t +=
+  | Execute_child_workflow_effect : {
+      workflow_id : string option;
+      workflow_type : string;
+      input : Codec.payload;
+      task_queue : string option;
+      parent_close_policy : int; (* 1=TERMINATE 2=ABANDON 3=REQUEST_CANCEL *)
+      execution_timeout : float;
+      run_timeout : float;
+    }
+      -> Codec.payload Effect.t
+
+let execute_child_workflow ?workflow_id ?task_queue
+    ?(parent_close_policy = Terminate) ?(execution_timeout = 0.)
+    ?(run_timeout = 0.) (_ : _ ctx) (w : ('i, 'o) t) (input : 'i) : 'o =
+  let policy =
+    match parent_close_policy with
+    | Terminate -> 1
+    | Abandon -> 2
+    | Request_cancel -> 3
+  in
+  let arg = Codec.to_payload w.input input in
+  let result =
+    Effect.perform
+      (Execute_child_workflow_effect
+         { workflow_id;
+           workflow_type = w.name;
+           input = arg;
+           task_queue;
+           parent_close_policy = policy;
+           execution_timeout;
+           run_timeout;
+         })
+  in
+  Codec.of_payload w.output result
+
 (* sleep performs this effect; the worker emits a Start_timer command and suspends
    the run, resuming when the matching FireTimer job arrives. *)
 type _ Effect.t += Start_timer_effect : { start_to_fire : float } -> unit Effect.t

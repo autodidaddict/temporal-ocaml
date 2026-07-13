@@ -51,6 +51,10 @@ let register_activity (a : (_, _) Activity.t) (t : t) : t =
 
 type resolution = R_ok of Codec.payload | R_fail of string
 
+(* A child's first (start) resolution: it was created with this run id, or it
+   could not be created. Its completion reuses [resolution] above. *)
+type child_start = Child_run of string | Child_start_fail of string
+
 (* External events the server delivers, kept in a single history-ordered log
    rather than per-kind maps. Order is irrelevant for activities/timers (the body
    demands them in a fixed sequence), but it is load-bearing for signals, which
@@ -68,6 +72,8 @@ type event =
     (* an admitted update: order-sensitive like a signal, delivered by the same
        cursor walk. Kept in the log so its state mutation replays; the accept/
        reject decision and the response are per-activation, not stored here. *)
+  | Child_started of int * child_start (* seq, start outcome *)
+  | Child_resolved of int * resolution (* seq, completion outcome *)
 
 type run_state = {
   mutable wf_name : string;
@@ -100,6 +106,7 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~run_id
   let commands = ref [] in
   let act_seq = ref 0 in
   let timer_seq = ref 0 in
+  let child_seq = ref 0 in
   (* the replay cursor: remaining events in history order. Peek the next event;
      advance only when the body consumes it. (When signals land, advancing past a
      signal entry is exactly where its handler will fire.) *)
@@ -269,6 +276,59 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~run_id
                   if not query_mode then
                     commands :=
                       Coresdk.Start_timer { seq = s; start_to_fire } :: !commands)
+          | Workflow.Execute_child_workflow_effect
+              { workflow_id; workflow_type; input; task_queue; parent_close_policy;
+                execution_timeout; run_timeout } ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                incr child_seq;
+                let s = !child_seq in
+                deliver_pending ();
+                (* a child resolves twice: first its start (run id, or a start
+                   failure), then its completion. Consume both from the log; if
+                   only the start is present the child is still running, so suspend
+                   without re-emitting. *)
+                match peek () with
+                | Some (Child_started (s', Child_start_fail msg)) when s' = s ->
+                  advance ();
+                  discontinue k (Failure ("child workflow start failed: " ^ msg))
+                | Some (Child_started (s', Child_run _run_id)) when s' = s ->
+                  advance ();
+                  deliver_pending ();
+                  (match peek () with
+                   | Some (Child_resolved (s'', R_ok payload)) when s'' = s ->
+                     advance ();
+                     continue k payload
+                   | Some (Child_resolved (s'', R_fail msg)) when s'' = s ->
+                     advance ();
+                     discontinue k (Failure ("child workflow failed: " ^ msg))
+                   | _ -> () (* started, still running: suspend *))
+                | _ ->
+                  (* not started yet: emit the start command and suspend. A query
+                     replay is read-only, so suppress it. *)
+                  if not query_mode then (
+                    let wid =
+                      match workflow_id with
+                      | Some id -> id
+                      | None -> Printf.sprintf "%s/%d" state.wf_id s
+                    in
+                    let tq =
+                      match task_queue with Some q -> q | None -> t.task_queue
+                    in
+                    commands :=
+                      Coresdk.Start_child_workflow_execution
+                        {
+                          seq = s;
+                          namespace = "";
+                          workflow_id = wid;
+                          workflow_type;
+                          task_queue = tq;
+                          input = [ input ];
+                          execution_timeout;
+                          run_timeout;
+                          parent_close_policy;
+                        }
+                      :: !commands))
           | Workflow.Continue_as_new_effect new_arg ->
             Some
               (fun (_ : (a, unit) continuation) ->
@@ -404,13 +464,25 @@ let apply_job (state : run_state) = function
        Respond_to_query) is handled separately from history application and is
        the next runtime increment; for now the job is decoded but not served. *)
     ()
-  | Coresdk.Resolve_child_workflow_execution_start _
-  | Coresdk.Resolve_child_workflow_execution _ ->
-    (* child workflow start/completion resolutions: decoded, but admitting them to
-       the event log (keyed by seq, like activities) and resuming
-       execute_child_workflow is the next runtime increment (ADR-0003); for now the
-       jobs are decoded but not served. *)
-    ()
+  | Coresdk.Resolve_child_workflow_execution_start { seq; outcome } ->
+    let cs =
+      match outcome with
+      | Coresdk.Child_start_succeeded run_id -> Child_run run_id
+      | Coresdk.Child_start_failed msg -> Child_start_fail msg
+      | Coresdk.Child_start_cancelled msg -> Child_start_fail ("cancelled: " ^ msg)
+      | Coresdk.Child_start_other -> Child_start_fail "unknown child start outcome"
+    in
+    state.events_rev <- Child_started (seq, cs) :: state.events_rev
+  | Coresdk.Resolve_child_workflow_execution { seq; result } ->
+    let r =
+      match result with
+      | Coresdk.Child_completed p ->
+        R_ok (match p with Some x -> x | None -> Codec.to_payload Codec.unit ())
+      | Coresdk.Child_failed msg -> R_fail msg
+      | Coresdk.Child_cancelled msg -> R_fail ("cancelled: " ^ msg)
+      | Coresdk.Child_result_other -> R_fail "unknown child result"
+    in
+    state.events_rev <- Child_resolved (seq, r) :: state.events_rev
   | Coresdk.Do_update { protocol_instance_id; name; input; run_validator = _ } ->
     (* admit the update to the log in job order, like a signal; the validator gate
        and the UpdateResponse are handled per-activation in run_workflow, which

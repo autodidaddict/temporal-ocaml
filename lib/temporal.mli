@@ -126,6 +126,28 @@ module Workflow : sig
       that exhausts its attempts resolves as a failure, which raises in the
       workflow body at the call site. *)
 
+  type parent_close_policy =
+    | Terminate  (** terminate the child when the parent closes (default) *)
+    | Abandon  (** leave the child running independently *)
+    | Request_cancel  (** request cancellation of the child *)
+
+  val execute_child_workflow :
+    ?workflow_id:string ->
+    ?task_queue:string ->
+    ?parent_close_policy:parent_close_policy ->
+    ?execution_timeout:float ->
+    ?run_timeout:float ->
+    _ ctx ->
+    ('i, 'o) t ->
+    'i ->
+    'o
+  (** [execute_child_workflow ctx child input] starts [child] (referred to by its
+      own workflow definition) as a child workflow, waits for it, and returns its
+      result. [workflow_id] defaults to a deterministic id derived from the
+      parent's id; [task_queue] defaults to the parent's; [parent_close_policy]
+      defaults to [Terminate]. A child that fails or is cancelled raises at the
+      call site, like a failed activity. *)
+
   val sleep : _ ctx -> float -> unit
   (** [sleep ctx seconds] durably suspends the workflow for [seconds] via a
       Temporal timer — it survives worker restarts and is deterministic on

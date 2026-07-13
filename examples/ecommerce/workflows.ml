@@ -24,6 +24,17 @@ open Model
    declaration to make plain what's being defined. *)
 open Workflow
 
+let shipment_workflow =
+  Workflow.define ~name:"ShipmentWorkflow"
+    ~input:Codec.(pair (list Line_item.codec) string)
+    ~output:Codec.string
+  @@ fun ctx ((items, ship_to) : Line_item.t list * string) ->
+  (* a clean linear hand-off: pack, dispatch, then confirm the tracking number *)
+  let package = execute_activity ctx Activities.pick_and_pack items in
+  (* later: poll delivery on a timer instead of a single confirm *)
+  execute_activity ctx Activities.dispatch_carrier (package, ship_to)
+  |> execute_activity ctx Activities.confirm_delivery
+
 let order_workflow =
   Workflow.define ~name:"OrderWorkflow" ~input:Order.codec ~output:Codec.string
   @@ fun ctx (o : Order.t) ->
@@ -36,23 +47,12 @@ let order_workflow =
   sleep ctx 1.0;
   (* later: on failure below, compensate with refund_payment (saga) *)
   let reservation = execute_activity ctx Activities.reserve_inventory o.items in
-  (* later: start ShipmentWorkflow as a child instead of an activity *)
+  (* ShipmentWorkflow runs as a child — its own execution, activities, and history *)
   let shipment =
-    execute_activity ctx Activities.request_shipment (o.order_id, o.ship_to)
+    execute_child_workflow ctx shipment_workflow (o.items, o.ship_to)
   in
   Printf.sprintf "order %s: charged %s, reserved %s, shipment %s" o.order_id charge
     reservation shipment
-
-let shipment_workflow =
-  Workflow.define ~name:"ShipmentWorkflow"
-    ~input:Codec.(pair (list Line_item.codec) string)
-    ~output:Codec.string
-  @@ fun ctx ((items, ship_to) : Line_item.t list * string) ->
-  (* a clean linear hand-off: pack, dispatch, then confirm the tracking number *)
-  let package = execute_activity ctx Activities.pick_and_pack items in
-  (* later: poll delivery on a timer instead of a single confirm *)
-  execute_activity ctx Activities.dispatch_carrier (package, ship_to)
-  |> execute_activity ctx Activities.confirm_delivery
 
 let return_workflow =
   Workflow.define ~name:"ReturnWorkflow" ~input:Return_request.codec
