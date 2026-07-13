@@ -45,7 +45,6 @@ let () =
     |> register_activity validate_order
     |> register_activity charge_payment
     |> register_activity reserve_inventory
-    |> register_activity request_shipment
     |> register_activity pick_and_pack
     |> register_activity dispatch_carrier
     |> register_activity confirm_delivery

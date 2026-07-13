@@ -38,12 +38,6 @@ let reserve_inventory =
     (fun (items : Line_item.t list) ->
       "rsv_" ^ String.concat "-" (List.map (fun (i : Line_item.t) -> i.sku) items))
 
-let request_shipment =
-  Activity.define ~name:"request_shipment"
-    ~input:Codec.(pair string string)
-    ~output:Codec.string
-    (fun ((order_id : string), (_ship_to : string)) -> "shp_" ^ order_id)
-
 let pick_and_pack =
   Activity.define ~name:"pick_and_pack"
     ~input:(Codec.list Line_item.codec) ~output:Codec.string
