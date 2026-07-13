@@ -404,6 +404,13 @@ let apply_job (state : run_state) = function
        Respond_to_query) is handled separately from history application and is
        the next runtime increment; for now the job is decoded but not served. *)
     ()
+  | Coresdk.Resolve_child_workflow_execution_start _
+  | Coresdk.Resolve_child_workflow_execution _ ->
+    (* child workflow start/completion resolutions: decoded, but admitting them to
+       the event log (keyed by seq, like activities) and resuming
+       execute_child_workflow is the next runtime increment (ADR-0003); for now the
+       jobs are decoded but not served. *)
+    ()
   | Coresdk.Do_update { protocol_instance_id; name; input; run_validator = _ } ->
     (* admit the update to the log in job order, like a signal; the validator gate
        and the UpdateResponse are handled per-activation in run_workflow, which

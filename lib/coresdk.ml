@@ -28,6 +28,20 @@ type activity_resolution =
   | Failed of string (* ActivityResolution.failed = Failure.message *)
   | Other_resolution
 
+(* Outcome of a child's first resolution (it was created, or could not be). *)
+type child_start_outcome =
+  | Child_start_succeeded of string (* the child's run_id *)
+  | Child_start_failed of string (* e.g. the workflow id already exists *)
+  | Child_start_cancelled of string
+  | Child_start_other
+
+(* Outcome of a child's completion resolution (child_workflow.ChildWorkflowResult). *)
+type child_result =
+  | Child_completed of payload option
+  | Child_failed of string
+  | Child_cancelled of string
+  | Child_result_other
+
 type wf_job =
   | Initialize_workflow of {
       workflow_type : string;
@@ -48,6 +62,11 @@ type wf_job =
       input : payload list;
       run_validator : bool; (* true on first delivery; false on replay *)
     }
+  | Resolve_child_workflow_execution_start of {
+      seq : int; (* matches the StartChildWorkflowExecution command's seq *)
+      outcome : child_start_outcome;
+    }
+  | Resolve_child_workflow_execution of { seq : int; result : child_result }
   | Remove_from_cache
   | Other
 
@@ -195,9 +214,101 @@ let decode_do_update s =
       run_validator = !run_validator;
     }
 
+(* ResolveChildWorkflowExecutionStart { seq=1; oneof {
+     ResolveChildWorkflowExecutionStartSuccess succeeded=2 { run_id=1 };
+     ResolveChildWorkflowExecutionStartFailure failed=3 { workflow_id=1;
+       workflow_type=2; StartChildWorkflowExecutionFailedCause cause=3 };
+     ResolveChildWorkflowExecutionStartCancelled cancelled=4 { failure=1 } } } *)
+let decode_resolve_child_start s =
+  let r = Pb.Reader.create s in
+  let seq = ref 0 and outcome = ref Child_start_other in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 0 -> seq := Pb.Reader.varint r
+    | 2, 2 ->
+      let succ = Pb.Reader.create (Pb.Reader.bytes r) in
+      let run_id = ref "" in
+      while not (Pb.Reader.at_end succ) do
+        match Pb.Reader.key succ with
+        | 1, 2 -> run_id := Pb.Reader.bytes succ
+        | _, w -> Pb.Reader.skip succ w
+      done;
+      outcome := Child_start_succeeded !run_id
+    | 3, 2 ->
+      let f = Pb.Reader.create (Pb.Reader.bytes r) in
+      let wid = ref "" and cause = ref 0 in
+      while not (Pb.Reader.at_end f) do
+        match Pb.Reader.key f with
+        | 1, 2 -> wid := Pb.Reader.bytes f
+        | 3, 0 -> cause := Pb.Reader.varint f
+        | _, w -> Pb.Reader.skip f w
+      done;
+      (* cause 1 = WORKFLOW_ALREADY_EXISTS (the only defined cause) *)
+      outcome :=
+        Child_start_failed
+          (if !cause = 1 then Printf.sprintf "child workflow id %S already exists" !wid
+           else Printf.sprintf "child workflow start failed (cause %d)" !cause)
+    | 4, 2 ->
+      let c = Pb.Reader.create (Pb.Reader.bytes r) in
+      let msg = ref "" in
+      while not (Pb.Reader.at_end c) do
+        match Pb.Reader.key c with
+        | 1, 2 -> msg := failure_message (Pb.Reader.bytes c)
+        | _, w -> Pb.Reader.skip c w
+      done;
+      outcome := Child_start_cancelled !msg
+    | _, w -> Pb.Reader.skip r w
+  done;
+  Resolve_child_workflow_execution_start { seq = !seq; outcome = !outcome }
+
+(* child_workflow.ChildWorkflowResult { oneof { Success completed=1 { result=1 };
+   Failure failed=2 { failure=1 }; Cancellation cancelled=3 { failure=1 } } } *)
+let decode_child_result s =
+  let r = Pb.Reader.create s in
+  let res = ref Child_result_other in
+  let deepest_failure b =
+    let f = Pb.Reader.create b in
+    let msg = ref "" in
+    while not (Pb.Reader.at_end f) do
+      match Pb.Reader.key f with
+      | 1, 2 -> msg := failure_message (Pb.Reader.bytes f)
+      | _, w -> Pb.Reader.skip f w
+    done;
+    !msg
+  in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 2 ->
+      let succ = Pb.Reader.create (Pb.Reader.bytes r) in
+      let p = ref None in
+      while not (Pb.Reader.at_end succ) do
+        match Pb.Reader.key succ with
+        | 1, 2 -> p := Some (Codec.decode_payload (Pb.Reader.bytes succ))
+        | _, w -> Pb.Reader.skip succ w
+      done;
+      res := Child_completed !p
+    | 2, 2 -> res := Child_failed (deepest_failure (Pb.Reader.bytes r))
+    | 3, 2 -> res := Child_cancelled (deepest_failure (Pb.Reader.bytes r))
+    | _, w -> Pb.Reader.skip r w
+  done;
+  !res
+
+(* ResolveChildWorkflowExecution { seq=1; ChildWorkflowResult result=2 } *)
+let decode_resolve_child s =
+  let r = Pb.Reader.create s in
+  let seq = ref 0 and result = ref Child_result_other in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 0 -> seq := Pb.Reader.varint r
+    | 2, 2 -> result := decode_child_result (Pb.Reader.bytes r)
+    | _, w -> Pb.Reader.skip r w
+  done;
+  Resolve_child_workflow_execution { seq = !seq; result = !result }
+
 (* WorkflowActivationJob { oneof { initialize_workflow=1; fire_timer=2;
-   query_workflow=5; signal_workflow=7; resolve_activity=8; do_update=14;
-   remove_from_cache=50 } } *)
+   query_workflow=5; signal_workflow=7; resolve_activity=8;
+   resolve_child_workflow_execution_start=10; resolve_child_workflow_execution=11;
+   do_update=14; remove_from_cache=50 } } *)
 let decode_wf_job s =
   let r = Pb.Reader.create s in
   let job = ref Other in
@@ -208,6 +319,8 @@ let decode_wf_job s =
     | 5, 2 -> job := decode_query_workflow (Pb.Reader.bytes r)
     | 7, 2 -> job := decode_signal_workflow (Pb.Reader.bytes r)
     | 8, 2 -> job := decode_resolve_activity (Pb.Reader.bytes r)
+    | 10, 2 -> job := decode_resolve_child_start (Pb.Reader.bytes r)
+    | 11, 2 -> job := decode_resolve_child (Pb.Reader.bytes r)
     | 14, 2 -> job := decode_do_update (Pb.Reader.bytes r)
     | 50, 2 ->
       ignore (Pb.Reader.bytes r);
@@ -266,6 +379,17 @@ type wf_command =
   | Continue_as_new of { arguments : payload list }
   | Respond_to_query of { query_id : string; result : query_result }
   | Update_response of { protocol_instance_id : string; outcome : update_outcome }
+  | Start_child_workflow_execution of {
+      seq : int;
+      namespace : string; (* "" to let core default to the parent's namespace *)
+      workflow_id : string;
+      workflow_type : string;
+      task_queue : string;
+      input : payload list;
+      execution_timeout : float; (* seconds; 0. to omit *)
+      run_timeout : float; (* seconds; 0. to omit *)
+      parent_close_policy : int; (* ParentClosePolicy: 1=TERMINATE 2=ABANDON 3=REQUEST_CANCEL *)
+    }
 
 (* google.protobuf.Duration { int64 seconds=1; int32 nanos=2 } *)
 let encode_duration seconds =
@@ -377,6 +501,27 @@ let encode_command = function
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 20 (Pb.Writer.contents ur);
     (* WorkflowCommand.update_response = 20 *)
+    Pb.Writer.contents cmd
+  | Start_child_workflow_execution c ->
+    (* StartChildWorkflowExecution { seq=1; namespace=2; workflow_id=3;
+         workflow_type=4; task_queue=5; input=6 (repeated Payload);
+         workflow_execution_timeout=7; workflow_run_timeout=8 (Duration);
+         parent_close_policy=10 (enum) } *)
+    let sc = Pb.Writer.create () in
+    Pb.Writer.int sc 1 c.seq;
+    if c.namespace <> "" then Pb.Writer.bytes sc 2 c.namespace;
+    Pb.Writer.bytes sc 3 c.workflow_id;
+    Pb.Writer.bytes sc 4 c.workflow_type;
+    Pb.Writer.bytes sc 5 c.task_queue;
+    List.iter (encode_payload_field sc 6) c.input;
+    if c.execution_timeout > 0. then
+      Pb.Writer.bytes sc 7 (encode_duration c.execution_timeout);
+    if c.run_timeout > 0. then
+      Pb.Writer.bytes sc 8 (encode_duration c.run_timeout);
+    if c.parent_close_policy > 0 then Pb.Writer.int sc 10 c.parent_close_policy;
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 11 (Pb.Writer.contents sc);
+    (* WorkflowCommand.start_child_workflow_execution = 11 *)
     Pb.Writer.contents cmd
 
 (* WorkflowActivationCompletion { run_id=1; successful=2 = Success{ commands=1 } } *)
