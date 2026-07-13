@@ -67,6 +67,21 @@ module Signal : sig
       argument. *)
 end
 
+(** A query: a named, typed, read-only request answered from a running (or
+    closed) workflow's current state. *)
+module Query : sig
+  type ('input, 'output) t
+
+  val define :
+    name:string ->
+    input:'input Codec.t ->
+    output:'output Codec.t ->
+    ('input, 'output) t
+  (** [define ~name ~input ~output] declares a query named [name] taking an
+      ['input] argument and returning an ['output]. Use [Codec.unit] for the
+      common no-argument query. *)
+end
+
 (** A workflow: deterministic orchestration of activities. *)
 module Workflow : sig
   type 'input ctx
@@ -106,6 +121,14 @@ module Workflow : sig
   (** [on_signal ctx signal handler] runs [handler] whenever [signal] is
       received. The handler runs synchronously and typically mutates state the
       body observes via {!wait_condition}. *)
+
+  val on_query : _ ctx -> ('a, 'b) Query.t -> ('a -> 'b) -> unit
+  (** [on_query ctx query handler] registers [handler] to answer [query]. The
+      handler must be read-only: it may inspect body state but must not mutate
+      it, run activities, sleep, or continue-as-new. It runs when a query
+      arrives, after the body has replayed to its current frontier, and its
+      result is returned to the caller. A query with no registered handler
+      answers with an error. *)
 
   val wait_condition : _ ctx -> (unit -> bool) -> unit
   (** [wait_condition ctx pred] blocks the workflow until [pred ()] holds,

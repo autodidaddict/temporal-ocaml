@@ -93,6 +93,25 @@ let on_signal (_ : _ ctx) (s : 'a Signal.t) (handler : 'a -> unit) : unit =
 let wait_condition (_ : _ ctx) (pred : unit -> bool) : unit =
   Effect.perform (Wait_condition_effect pred)
 
+(* on_query registers a read-only handler (the query's decoder and encoder wrapped
+   around the user's callback). The worker collects these while replaying the body
+   to its frontier, then invokes the one matching an incoming QueryWorkflow job.
+   The handler is a plain [payload -> payload]; performing any workflow effect from
+   inside it is unhandled (query answering runs outside the effect handler), which
+   is exactly the read-only guarantee. *)
+type _ Effect.t +=
+  | Register_query_handler_effect :
+      string * (Codec.payload -> Codec.payload)
+      -> unit Effect.t
+
+let on_query (_ : _ ctx) (q : ('a, 'b) Query.t) (handler : 'a -> 'b) : unit =
+  Effect.perform
+    (Register_query_handler_effect
+       ( q.Query.name,
+         fun p ->
+           Codec.to_payload q.Query.output (handler (Codec.of_payload q.Query.input p))
+       ))
+
 (* registered form: builds the typed ctx (carrying the workflow's own input
    encoder) from the per-activation runtime info, then runs the body. *)
 type reg = {

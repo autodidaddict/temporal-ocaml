@@ -77,8 +77,14 @@ let get_run run_id =
     Hashtbl.replace runs run_id s;
     s
 
+(* [queries] are the (query_id, query_type, arguments) of any QueryWorkflow jobs
+   on this activation. When [query_mode] is set (a pure-query activation), the body
+   is replayed read-only: it rebuilds state from history but suppresses every
+   workflow-advancing command, so it neither re-schedules the frontier's pending
+   effect nor re-completes an already-finished run. Queries are answered from the
+   handlers the body registers, in either mode. *)
 let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
-    ~history_length : Coresdk.wf_command list =
+    ~history_length ~query_mode ~queries : Coresdk.wf_command list =
   let commands = ref [] in
   let act_seq = ref 0 in
   let timer_seq = ref 0 in
@@ -90,6 +96,11 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
   let advance () = match !cursor with _ :: rest -> cursor := rest | [] -> () in
   (* signal handlers registered by the body on this run (rebuilt each re-run). *)
   let signal_handlers : (string, Codec.payload -> unit) Hashtbl.t =
+    Hashtbl.create 8
+  in
+  (* query handlers registered by the body on this run (rebuilt each re-run),
+     invoked after the replay reaches its frontier to answer QueryWorkflow jobs. *)
+  let query_handlers : (string, Codec.payload -> Codec.payload) Hashtbl.t =
     Hashtbl.create 8
   in
   (* deliver any signals at the cursor head to their handlers, advancing past
@@ -118,14 +129,19 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
     {
       retc =
         (fun (output : Codec.payload) ->
-          commands := [ Coresdk.Complete_workflow_execution (Some output) ]);
+          (* a read-only query replay must not (re-)complete the workflow *)
+          if not query_mode then
+            commands := [ Coresdk.Complete_workflow_execution (Some output) ]);
       exnc =
         (fun exn ->
           (* an uncaught exception in the workflow body fails the execution;
              catch it in the body (try/with) to compensate and continue (saga) *)
           let msg = Printexc.to_string exn in
-          Eio.traceln "[wf] failing workflow execution: %s" msg;
-          commands := [ Coresdk.Fail_workflow_execution msg ]);
+          if query_mode then
+            Eio.traceln "[wf] workflow raised during query replay: %s" msg
+          else (
+            Eio.traceln "[wf] failing workflow execution: %s" msg;
+            commands := [ Coresdk.Fail_workflow_execution msg ]));
       effc =
         (fun (type a) (eff : a Effect.t) ->
           match eff with
@@ -144,19 +160,22 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
                   advance ();
                   discontinue k (Failure ("activity failed: " ^ msg))
                 | _ ->
-                  (* not resolved yet: schedule it and suspend this run *)
-                  commands :=
-                    Coresdk.Schedule_activity
-                      {
-                        seq = s;
-                        activity_id = string_of_int s;
-                        activity_type;
-                        task_queue = t.task_queue;
-                        arguments = [ arg ];
-                        start_to_close;
-                        max_attempts;
-                      }
-                    :: !commands)
+                  (* not resolved yet: schedule it and suspend this run. A query
+                     replay is read-only — suppress the command and just suspend at
+                     the frontier. *)
+                  if not query_mode then
+                    commands :=
+                      Coresdk.Schedule_activity
+                        {
+                          seq = s;
+                          activity_id = string_of_int s;
+                          activity_type;
+                          task_queue = t.task_queue;
+                          arguments = [ arg ];
+                          start_to_close;
+                          max_attempts;
+                        }
+                      :: !commands)
           | Workflow.Start_timer_effect { start_to_fire } ->
             Some
               (fun (k : (a, unit) continuation) ->
@@ -166,17 +185,26 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
                 match peek () with
                 | Some (Timer_fired s') when s' = s -> advance (); continue k ()
                 | _ ->
-                  commands :=
-                    Coresdk.Start_timer { seq = s; start_to_fire } :: !commands)
+                  if not query_mode then
+                    commands :=
+                      Coresdk.Start_timer { seq = s; start_to_fire } :: !commands)
           | Workflow.Continue_as_new_effect new_arg ->
             Some
               (fun (_ : (a, unit) continuation) ->
-                (* terminal: end this run, start a fresh one; drop the k *)
-                commands := [ Coresdk.Continue_as_new { arguments = [ new_arg ] } ])
+                (* terminal: end this run, start a fresh one; drop the k. A query
+                   replay is read-only, so it never emits this. *)
+                if not query_mode then
+                  commands :=
+                    [ Coresdk.Continue_as_new { arguments = [ new_arg ] } ])
           | Workflow.Register_signal_handler_effect (name, handler) ->
             Some
               (fun (k : (a, unit) continuation) ->
                 Hashtbl.replace signal_handlers name handler;
+                continue k ())
+          | Workflow.Register_query_handler_effect (name, handler) ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                Hashtbl.replace query_handlers name handler;
                 continue k ())
           | Workflow.Wait_condition_effect pred ->
             Some
@@ -186,7 +214,30 @@ let run_workflow (t : t) (wf : Workflow.reg) (state : run_state) ~can_suggested
                 else () (* condition false: suspend, emit no command *))
           | _ -> None);
     };
-  List.rev !commands
+  (* answer each query on this activation from the handlers the body registered as
+     it replayed to its frontier. A missing or raising handler answers with a
+     failure rather than failing the workflow. *)
+  let query_commands =
+    List.map
+      (fun (query_id, query_type, arguments) ->
+        let result =
+          match Hashtbl.find_opt query_handlers query_type with
+          | None ->
+            Coresdk.Query_failed
+              (Printf.sprintf "no query handler registered for %S" query_type)
+          | Some h -> (
+            let arg =
+              match arguments with
+              | p :: _ -> p
+              | [] -> Codec.to_payload Codec.unit ()
+            in
+            try Coresdk.Query_succeeded (h arg)
+            with e -> Coresdk.Query_failed (Printexc.to_string e))
+        in
+        Coresdk.Respond_to_query { query_id; result })
+      queries
+  in
+  List.rev !commands @ query_commands
 
 let apply_job (state : run_state) = function
   | Coresdk.Initialize_workflow { workflow_type; arguments } ->
@@ -206,6 +257,12 @@ let apply_job (state : run_state) = function
   | Coresdk.Signal_workflow { signal_name; input } ->
     let p = match input with p :: _ -> p | [] -> Codec.to_payload Codec.unit () in
     state.events_rev <- Signal (signal_name, p) :: state.events_rev
+  | Coresdk.Query_workflow _ ->
+    (* Queries don't advance the workflow, so they are not appended to the event
+       log. Answering a query (re-run the body in read-only mode and emit
+       Respond_to_query) is handled separately from history application and is
+       the next runtime increment; for now the job is decoded but not served. *)
+    ()
   | Coresdk.Remove_from_cache | Coresdk.Other -> ()
 
 let workflow_loop (t : t) =
@@ -222,6 +279,28 @@ let workflow_loop (t : t) =
       in
       let state = get_run a.Coresdk.run_id in
       List.iter (apply_job state) a.Coresdk.jobs;
+      (* QueryWorkflow jobs are answered by re-running the body to its frontier;
+         pull them out, and note whether this activation carries nothing but
+         queries — if so the replay must be read-only (see run_workflow). *)
+      let queries =
+        List.filter_map
+          (function
+            | Coresdk.Query_workflow { query_id; query_type; arguments } ->
+              Some (query_id, query_type, arguments)
+            | _ -> None)
+          a.Coresdk.jobs
+      in
+      let query_mode =
+        queries <> []
+        && not
+             (List.exists
+                (function
+                  | Coresdk.Query_workflow _ | Coresdk.Remove_from_cache
+                  | Coresdk.Other ->
+                    false
+                  | _ -> true)
+                a.Coresdk.jobs)
+      in
       let commands =
         if evict then (
           Hashtbl.remove runs a.Coresdk.run_id;
@@ -235,7 +314,7 @@ let workflow_loop (t : t) =
           | Some wf ->
             run_workflow t wf state
               ~can_suggested:a.Coresdk.continue_as_new_suggested
-              ~history_length:a.Coresdk.history_length
+              ~history_length:a.Coresdk.history_length ~query_mode ~queries
           | None ->
             Eio.traceln "[wf] no workflow registered as %S" state.wf_name;
             []

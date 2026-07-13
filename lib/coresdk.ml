@@ -33,6 +33,11 @@ type wf_job =
   | Resolve_activity of { seq : int; result : activity_resolution }
   | Fire_timer of { seq : int }
   | Signal_workflow of { signal_name : string; input : payload list }
+  | Query_workflow of {
+      query_id : string; (* correlates the RespondToQuery we send back *)
+      query_type : string; (* the query name; routes to a handler *)
+      arguments : payload list;
+    }
   | Remove_from_cache
   | Other
 
@@ -139,8 +144,24 @@ let decode_signal_workflow s =
   done;
   Signal_workflow { signal_name = !name; input = List.rev !input }
 
+(* QueryWorkflow { query_id=1; query_type=2; arguments=3 (repeated Payload) }.
+   query_id correlates the RespondToQuery command we send back; query_type is the
+   query name the workflow body routes to a registered handler. *)
+let decode_query_workflow s =
+  let r = Pb.Reader.create s in
+  let query_id = ref "" and query_type = ref "" and args = ref [] in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 2 -> query_id := Pb.Reader.bytes r
+    | 2, 2 -> query_type := Pb.Reader.bytes r
+    | 3, 2 -> args := decode_payloads_field r !args
+    | _, w -> Pb.Reader.skip r w
+  done;
+  Query_workflow
+    { query_id = !query_id; query_type = !query_type; arguments = List.rev !args }
+
 (* WorkflowActivationJob { oneof { initialize_workflow=1; fire_timer=2;
-   signal_workflow=7; resolve_activity=8; remove_from_cache=50 } } *)
+   query_workflow=5; signal_workflow=7; resolve_activity=8; remove_from_cache=50 } } *)
 let decode_wf_job s =
   let r = Pb.Reader.create s in
   let job = ref Other in
@@ -148,6 +169,7 @@ let decode_wf_job s =
     match Pb.Reader.key r with
     | 1, 2 -> job := decode_initialize (Pb.Reader.bytes r)
     | 2, 2 -> job := decode_fire_timer (Pb.Reader.bytes r)
+    | 5, 2 -> job := decode_query_workflow (Pb.Reader.bytes r)
     | 7, 2 -> job := decode_signal_workflow (Pb.Reader.bytes r)
     | 8, 2 -> job := decode_resolve_activity (Pb.Reader.bytes r)
     | 50, 2 ->
@@ -179,6 +201,10 @@ let decode_wf_activation s =
 
 (* ---- encode: WorkflowActivationCompletion ----------------------------- *)
 
+(* A query answer: the encoded handler result, or a failure message when the
+   handler raised or no handler was registered for the query type. *)
+type query_result = Query_succeeded of payload | Query_failed of string
+
 type wf_command =
   | Schedule_activity of {
       seq : int;
@@ -193,6 +219,7 @@ type wf_command =
   | Complete_workflow_execution of payload option
   | Fail_workflow_execution of string
   | Continue_as_new of { arguments : payload list }
+  | Respond_to_query of { query_id : string; result : query_result }
 
 (* google.protobuf.Duration { int64 seconds=1; int32 nanos=2 } *)
 let encode_duration seconds =
@@ -273,6 +300,22 @@ let encode_command = function
     Pb.Writer.bytes cmd 8 (Pb.Writer.contents can);
     (* WorkflowCommand.continue_as_new_workflow_execution = 8;
        ContinueAsNewWorkflowExecution.arguments = 3 *)
+    Pb.Writer.contents cmd
+  | Respond_to_query { query_id; result } ->
+    (* QueryResult { query_id=1;
+         oneof { QuerySuccess succeeded=2 { Payload response=1 };
+                 temporal.api.failure.v1.Failure failed=3 } } *)
+    let qr = Pb.Writer.create () in
+    Pb.Writer.bytes qr 1 query_id;
+    (match result with
+     | Query_succeeded response ->
+       let succ = Pb.Writer.create () in
+       encode_payload_field succ 1 response;
+       Pb.Writer.bytes qr 2 (Pb.Writer.contents succ)
+     | Query_failed msg -> Pb.Writer.bytes qr 3 (encode_failure msg));
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 3 (Pb.Writer.contents qr);
+    (* WorkflowCommand.respond_to_query = 3 *)
     Pb.Writer.contents cmd
 
 (* WorkflowActivationCompletion { run_id=1; successful=2 = Success{ commands=1 } } *)

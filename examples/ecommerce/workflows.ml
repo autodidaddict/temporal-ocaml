@@ -82,11 +82,18 @@ let countdown_workflow =
 let approve = Signal.define ~name:"approve" Codec.unit
 let reject = Signal.define ~name:"reject" Codec.string
 
+(* A read-only query over the same state the signals drive: "pending" until a
+   decision arrives, then the decision. Answerable while the workflow is blocked
+   in wait_condition and after it has closed. *)
+let status_query = Query.define ~name:"status" ~input:Codec.unit ~output:Codec.string
+
 let approval_workflow =
   Workflow.define ~name:"ApprovalWorkflow" ~input:Codec.string ~output:Codec.string
   @@ fun ctx (subject : string) ->
   let decision = ref None in
   on_signal ctx approve (fun () -> decision := Some "approved");
   on_signal ctx reject (fun reason -> decision := Some ("rejected: " ^ reason));
+  on_query ctx status_query (fun () ->
+      match !decision with None -> "pending" | Some d -> d);
   wait_condition ctx (fun () -> !decision <> None);
   Printf.sprintf "%s -> %s" subject (Option.get !decision)

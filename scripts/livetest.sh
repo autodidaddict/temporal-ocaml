@@ -108,6 +108,18 @@ want = sys.argv[1:]
 print("yes" if all(any(w in t for t in types) for w in want) else "no")
 ' "$@" 2>/dev/null
 }
+query() { # id type -> decoded query result value
+  # `--output json` already applies the data converter, so the result is the
+  # decoded value under queryResult (a list), not a base64 payload envelope.
+  temporal workflow query --workflow-id "$1" --type "$2" --output json 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+r = d.get("queryResult")
+if isinstance(r, list) and r:
+    v = r[0]
+    print(v if isinstance(v, str) else json.dumps(v))
+' 2>/dev/null
+}
 
 # ---- scenario 1 + 2: happy path with a durable timer --------------------------
 log "scenario 1+2: happy path + durable timer"
@@ -161,6 +173,21 @@ st="$(await_terminal smoke-reject)"
 case "$st" in *COMPLETED) pass "reject signal COMPLETED" ;; *) fail "reject status: $st" ;; esac
 res="$(result smoke-reject)"
 case "$res" in *"expense-43 -> rejected: too expensive"*) pass "reject decision + typed reason" ;; *) fail "reject result: $res" ;; esac
+
+# ---- scenario 6: queries ------------------------------------------------------
+log "scenario 6: query a running then a closed workflow"
+# while running (blocked in wait_condition) the status query answers "pending" via
+# a read-only replay to the frontier that emits no workflow-advancing commands
+start_wf smoke-query ApprovalWorkflow '"expense-99"'
+sleep 2
+q1="$(query smoke-query status)"
+case "$q1" in *pending*) pass "query while running -> pending" ;; *) fail "running query: $q1" ;; esac
+# after a decision + completion, querying the closed workflow answers "approved"
+temporal workflow signal --workflow-id smoke-query --name approve >/dev/null 2>&1
+st="$(await_terminal smoke-query)"
+case "$st" in *COMPLETED) pass "queried workflow COMPLETED after approve" ;; *) fail "query wf status: $st" ;; esac
+q2="$(query smoke-query status)"
+case "$q2" in *approved*) pass "query after close -> approved" ;; *) fail "closed query: $q2" ;; esac
 
 # ---- summary ------------------------------------------------------------------
 echo
