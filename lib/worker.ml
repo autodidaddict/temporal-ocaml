@@ -290,6 +290,13 @@ let apply_job (state : run_state) = function
        Respond_to_query) is handled separately from history application and is
        the next runtime increment; for now the job is decoded but not served. *)
     ()
+  | Coresdk.Do_update _ ->
+    (* An update is an order-sensitive event (mutates state like a signal) that
+       also returns a value (like a query) and may be gated by a validator.
+       Admitting it to the event log, running the validator, firing the handler,
+       and emitting the UpdateResponse(s) is the next runtime increment; for now
+       the job is decoded but not served. *)
+    ()
   | Coresdk.Remove_from_cache | Coresdk.Other -> ()
 
 let workflow_loop (t : t) =

@@ -38,6 +38,12 @@ type wf_job =
       query_type : string; (* the query name; routes to a handler *)
       arguments : payload list;
     }
+  | Do_update of {
+      protocol_instance_id : string; (* correlates the UpdateResponse(s) we send *)
+      name : string; (* the update handler name *)
+      input : payload list;
+      run_validator : bool; (* true on first delivery; false on replay *)
+    }
   | Remove_from_cache
   | Other
 
@@ -160,8 +166,31 @@ let decode_query_workflow s =
   Query_workflow
     { query_id = !query_id; query_type = !query_type; arguments = List.rev !args }
 
+(* DoUpdate { id=1; protocol_instance_id=2; name=3; input=4 (repeated Payload);
+   run_validator=7 (bool) }. protocol_instance_id correlates the UpdateResponse(s)
+   we send; run_validator is true only on first delivery (core doesn't re-run the
+   validator on replay). id and headers/meta are not needed by the worker. *)
+let decode_do_update s =
+  let r = Pb.Reader.create s in
+  let pid = ref "" and name = ref "" and input = ref [] and run_validator = ref false in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 2, 2 -> pid := Pb.Reader.bytes r
+    | 3, 2 -> name := Pb.Reader.bytes r
+    | 4, 2 -> input := decode_payloads_field r !input
+    | 7, 0 -> run_validator := Pb.Reader.varint r <> 0
+    | _, w -> Pb.Reader.skip r w
+  done;
+  Do_update
+    { protocol_instance_id = !pid;
+      name = !name;
+      input = List.rev !input;
+      run_validator = !run_validator;
+    }
+
 (* WorkflowActivationJob { oneof { initialize_workflow=1; fire_timer=2;
-   query_workflow=5; signal_workflow=7; resolve_activity=8; remove_from_cache=50 } } *)
+   query_workflow=5; signal_workflow=7; resolve_activity=8; do_update=14;
+   remove_from_cache=50 } } *)
 let decode_wf_job s =
   let r = Pb.Reader.create s in
   let job = ref Other in
@@ -172,6 +201,7 @@ let decode_wf_job s =
     | 5, 2 -> job := decode_query_workflow (Pb.Reader.bytes r)
     | 7, 2 -> job := decode_signal_workflow (Pb.Reader.bytes r)
     | 8, 2 -> job := decode_resolve_activity (Pb.Reader.bytes r)
+    | 14, 2 -> job := decode_do_update (Pb.Reader.bytes r)
     | 50, 2 ->
       ignore (Pb.Reader.bytes r);
       job := Remove_from_cache (* remove_from_cache = 50 *)
@@ -205,6 +235,14 @@ let decode_wf_activation s =
    handler raised or no handler was registered for the query type. *)
 type query_result = Query_succeeded of payload | Query_failed of string
 
+(* One UpdateResponse. A successful update emits two of these in order — accepted,
+   then completed; a validator rejection (or a handler that raised after
+   acceptance) emits a rejected. *)
+type update_outcome =
+  | Update_accepted (* validator passed / not asked to validate *)
+  | Update_rejected of string (* validator failed, or handler raised *)
+  | Update_completed of payload (* handler result *)
+
 type wf_command =
   | Schedule_activity of {
       seq : int;
@@ -220,6 +258,7 @@ type wf_command =
   | Fail_workflow_execution of string
   | Continue_as_new of { arguments : payload list }
   | Respond_to_query of { query_id : string; result : query_result }
+  | Update_response of { protocol_instance_id : string; outcome : update_outcome }
 
 (* google.protobuf.Duration { int64 seconds=1; int32 nanos=2 } *)
 let encode_duration seconds =
@@ -316,6 +355,21 @@ let encode_command = function
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 3 (Pb.Writer.contents qr);
     (* WorkflowCommand.respond_to_query = 3 *)
+    Pb.Writer.contents cmd
+  | Update_response { protocol_instance_id; outcome } ->
+    (* UpdateResponse { protocol_instance_id=1;
+         oneof { google.protobuf.Empty accepted=2;
+                 temporal.api.failure.v1.Failure rejected=3;
+                 temporal.api.common.v1.Payload completed=4 } } *)
+    let ur = Pb.Writer.create () in
+    Pb.Writer.bytes ur 1 protocol_instance_id;
+    (match outcome with
+     | Update_accepted -> Pb.Writer.bytes ur 2 "" (* Empty: a zero-length message *)
+     | Update_rejected msg -> Pb.Writer.bytes ur 3 (encode_failure msg)
+     | Update_completed p -> encode_payload_field ur 4 p);
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 20 (Pb.Writer.contents ur);
+    (* WorkflowCommand.update_response = 20 *)
     Pb.Writer.contents cmd
 
 (* WorkflowActivationCompletion { run_id=1; successful=2 = Success{ commands=1 } } *)
