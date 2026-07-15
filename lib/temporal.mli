@@ -104,6 +104,10 @@ module Workflow : sig
 
   type ('input, 'output) t
 
+  type 'a future
+  (** A handle to the not-yet-ready result of a started operation (activity, timer,
+      or child workflow). Produced by a [start_*], consumed by {!await}. *)
+
   val define :
     name:string ->
     input:'input Codec.t ->
@@ -152,6 +156,55 @@ module Workflow : sig
   (** [sleep ctx seconds] durably suspends the workflow for [seconds] via a
       Temporal timer — it survives worker restarts and is deterministic on
       replay, unlike a wall-clock [Unix.sleep]. *)
+
+  val start_activity :
+    ?start_to_close:float ->
+    ?max_attempts:int ->
+    _ ctx ->
+    ('i, 'o) Activity.t ->
+    'i ->
+    'o future
+  (** [start_activity ctx activity input] schedules [activity] and returns a future
+      immediately; the activity runs while the workflow continues.
+      {!execute_activity} is [await ctx (start_activity ...)]. *)
+
+  val start_timer : _ ctx -> float -> unit future
+  (** [start_timer ctx seconds] starts a durable timer and returns a future that
+      resolves when it fires. {!sleep} is [await ctx (start_timer ...)]. *)
+
+  val start_child_workflow :
+    ?workflow_id:string ->
+    ?task_queue:string ->
+    ?parent_close_policy:parent_close_policy ->
+    ?execution_timeout:float ->
+    ?run_timeout:float ->
+    _ ctx ->
+    ('i, 'o) t ->
+    'i ->
+    'o future
+  (** [start_child_workflow ctx child input] starts [child] and returns a future for
+      its result. {!execute_child_workflow} is [await ctx (start_child_workflow ...)]. *)
+
+  val await : _ ctx -> 'a future -> 'a
+  (** [await ctx f] blocks the workflow until [f] resolves and returns its value,
+      raising at the call site if the operation failed. *)
+
+  val await_all : _ ctx -> 'a future list -> 'a list
+  (** [await_all ctx fs] waits for every future in [fs]. Because each was started
+      eagerly the operations run concurrently; this only waits for them all and
+      returns the results in order. Start several activities, then [await_all], for
+      fan-out and fan-in. *)
+
+  val await_any : _ ctx -> 'a future list -> 'a
+  (** [await_any ctx fs] returns the result of the first future to resolve. The
+      losers keep running (Promise.race semantics); cancelling them awaits the
+      cancellation-scope work. *)
+
+  val spawn : _ ctx -> (unit -> 'a) -> 'a future
+  (** [spawn ctx f] runs [f] as a concurrent fiber, scheduled cooperatively with the
+      rest of the workflow, and returns a future for its result. Use it for
+      independent concurrent control flow; to fan out operations, [start_*] plus
+      {!await_all} is simpler. *)
 
   val on_signal : _ ctx -> 'a Signal.t -> ('a -> unit) -> unit
   (** [on_signal ctx signal handler] runs [handler] whenever [signal] is

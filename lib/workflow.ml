@@ -33,40 +33,27 @@ type ('i, 'o) t = {
 
 let define ~name ~input ~output run = { name; input; output; run }
 
-(* execute_activity performs this effect; the worker's handler (worker.ml) either
-   resolves it (activity already completed, replayed from history) or emits a
-   Schedule_activity command and suspends the workflow. It lives here, with its
-   performer; Worker matches it as [Workflow.Schedule_activity_effect]. *)
+(* An operation the workflow has started and can await: an activity, a timer, a
+   child workflow, or a spawned fiber, keyed by its per-kind sequence number. *)
+type op = Op_activity of int | Op_timer of int | Op_child of int | Op_fiber of int
+
+(* What happens to a running child when the parent closes. *)
+type parent_close_policy = Terminate | Abandon | Request_cancel
+
+(* start_* emit their command eagerly (once) and return the operation's handle
+   without blocking; await parks the fiber on a handle until the operation resolves.
+   The worker (replay.ml) performs the emission and the parking; these effects live
+   here with their performers. *)
 type _ Effect.t +=
-  | Schedule_activity_effect : {
+  | Start_activity_effect : {
       activity_type : string;
       arg : Codec.payload;
       start_to_close : float;
       max_attempts : int;
     }
-      -> Codec.payload Effect.t
-
-let execute_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : _ ctx)
-    (a : ('i, 'o) Activity.t) (input : 'i) : 'o =
-  let arg = Codec.to_payload a.Activity.input input in
-  let result =
-    Effect.perform
-      (Schedule_activity_effect
-         { activity_type = a.Activity.name; arg; start_to_close; max_attempts })
-  in
-  Codec.of_payload a.Activity.output result
-
-(* What happens to a running child when the parent closes. *)
-type parent_close_policy = Terminate | Abandon | Request_cancel
-
-(* execute_child_workflow starts another workflow as a child and waits for its
-   result. The worker resolves it from the child's two history resolutions (start,
-   then completion) or, the first time, emits a Start_child_workflow_execution
-   command and suspends. The child is named/typed by its own [Workflow.t], so the
-   codecs come for free. A [None] workflow_id/task_queue lets the worker default
-   them (deterministic id from the parent id + seq; the parent's task queue). *)
-type _ Effect.t +=
-  | Execute_child_workflow_effect : {
+      -> op Effect.t
+  | Start_timer_effect : { start_to_fire : float } -> op Effect.t
+  | Start_child_effect : {
       workflow_id : string option;
       workflow_type : string;
       input : Codec.payload;
@@ -75,11 +62,61 @@ type _ Effect.t +=
       execution_timeout : float;
       run_timeout : float;
     }
-      -> Codec.payload Effect.t
+      -> op Effect.t
+  | Await_effect : op -> Codec.payload Effect.t
+  | Await_any_effect : op list -> (int * Codec.payload) Effect.t
+  | Spawn_effect : (unit -> unit) -> op Effect.t
 
-let execute_child_workflow ?workflow_id ?task_queue
-    ?(parent_close_policy = Terminate) ?(execution_timeout = 0.)
-    ?(run_timeout = 0.) (_ : _ ctx) (w : ('i, 'o) t) (input : 'i) : 'o =
+(* a handle to a not-yet-ready result: the pending operation plus how to decode it *)
+type 'a future = { op : op; decode : Codec.payload -> 'a }
+
+let await (_ : _ ctx) (f : 'a future) : 'a =
+  f.decode (Effect.perform (Await_effect f.op))
+
+(* await every future. The operations run concurrently, since each was started
+   eagerly; this only waits for them all. *)
+let await_all ctx (fs : 'a future list) : 'a list = List.map (await ctx) fs
+
+(* the first future to resolve; the losers keep running (Promise.race semantics) *)
+let await_any (_ : _ ctx) (fs : 'a future list) : 'a =
+  let idx, payload =
+    Effect.perform (Await_any_effect (List.map (fun f -> f.op) fs))
+  in
+  (List.nth fs idx).decode payload
+
+(* spawn a concurrent fiber running [f], scheduled cooperatively with the rest of the
+   workflow; returns a future for its result. The result value rides in [cell], which
+   the fiber sets on completion and the future's decode reads. *)
+let spawn (_ : _ ctx) (f : unit -> 'a) : 'a future =
+  let cell = ref None in
+  let op = Effect.perform (Spawn_effect (fun () -> cell := Some (f ()))) in
+  { op; decode = (fun _ -> match !cell with Some v -> v | None -> raise Not_found) }
+
+let start_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : _ ctx)
+    (a : ('i, 'o) Activity.t) (input : 'i) : 'o future =
+  let arg = Codec.to_payload a.Activity.input input in
+  let op =
+    Effect.perform
+      (Start_activity_effect
+         { activity_type = a.Activity.name; arg; start_to_close; max_attempts })
+  in
+  { op; decode = Codec.of_payload a.Activity.output }
+
+(* execute_activity is start-and-await: schedule [activity], wait for it, and return
+   the result (raising at the call site if it failed) *)
+let execute_activity ?start_to_close ?max_attempts ctx a input =
+  await ctx (start_activity ?start_to_close ?max_attempts ctx a input)
+
+let start_timer (_ : _ ctx) (seconds : float) : unit future =
+  let op = Effect.perform (Start_timer_effect { start_to_fire = seconds }) in
+  { op; decode = (fun _ -> ()) }
+
+(* sleep is start-and-await over a durable timer *)
+let sleep ctx (seconds : float) : unit = await ctx (start_timer ctx seconds)
+
+let start_child_workflow ?workflow_id ?task_queue ?(parent_close_policy = Terminate)
+    ?(execution_timeout = 0.) ?(run_timeout = 0.) (_ : _ ctx) (w : ('i, 'o) t)
+    (input : 'i) : 'o future =
   let policy =
     match parent_close_policy with
     | Terminate -> 1
@@ -87,9 +124,9 @@ let execute_child_workflow ?workflow_id ?task_queue
     | Request_cancel -> 3
   in
   let arg = Codec.to_payload w.input input in
-  let result =
+  let op =
     Effect.perform
-      (Execute_child_workflow_effect
+      (Start_child_effect
          { workflow_id;
            workflow_type = w.name;
            input = arg;
@@ -99,14 +136,14 @@ let execute_child_workflow ?workflow_id ?task_queue
            run_timeout;
          })
   in
-  Codec.of_payload w.output result
+  { op; decode = Codec.of_payload w.output }
 
-(* sleep performs this effect; the worker emits a Start_timer command and suspends
-   the run, resuming when the matching FireTimer job arrives. *)
-type _ Effect.t += Start_timer_effect : { start_to_fire : float } -> unit Effect.t
-
-let sleep (_ : _ ctx) (seconds : float) : unit =
-  Effect.perform (Start_timer_effect { start_to_fire = seconds })
+(* execute_child_workflow is start-and-await: start the child and wait for it *)
+let execute_child_workflow ?workflow_id ?task_queue ?parent_close_policy
+    ?execution_timeout ?run_timeout ctx w input =
+  await ctx
+    (start_child_workflow ?workflow_id ?task_queue ?parent_close_policy
+       ?execution_timeout ?run_timeout ctx w input)
 
 (* continue_as_new ends this run and atomically starts a fresh one (same workflow
    id, new run id, empty history) with new input; the handler emits the terminal

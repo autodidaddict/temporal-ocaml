@@ -12,26 +12,28 @@
    See the License for the specific language governing permissions and
    limitations under the License. *)
 
-(* The workflow replay engine: the effect handler that drives a workflow body from
-   its recorded history ([Replay_state]). We re-run the body from the top on each
-   activation; a cursor walks the event log in order — execute_activity / sleep /
-   child workflow consume the next matching resolution and resume the body, and if
-   the demanded resolution has not arrived yet we emit the command and suspend (drop
-   the continuation). This is the deterministic replay model, minus persisting
-   continuations across polls. *)
+(* The workflow replay engine: a deterministic cooperative scheduler over
+   Effect.Deep that drives a workflow body from its recorded history
+   ([Replay_state]). We re-run the body from the top on each activation. The body
+   parks on each operation it awaits (activity, timer, child); a scheduler then walks
+   the history log in order, waking the parked fiber as each resolution arrives and
+   delivering signals and updates at their history positions. Operations still parked
+   after the log is drained emit their schedule command, and the activation ends.
+
+   With a single fiber this reproduces the older single-cursor walk exactly; the ready
+   queue and per-seq waiter tables are what generalize it to many fibers. This is the
+   deterministic replay model, minus persisting continuations across polls. *)
 
 open Replay_state
 
-(* [queries] are the (query_id, query_type, arguments) of any QueryWorkflow jobs,
-   and [updates] the (protocol_instance_id, run_validator) of any DoUpdate jobs, on
-   this activation (whose Update events apply_job already appended to the log, in
-   job order). When [query_mode] is set (a pure-query activation), the body is
-   replayed read-only: it rebuilds state from history but suppresses every
-   workflow-advancing command, so it neither re-schedules the frontier's pending
-   effect nor re-completes an already-finished run. Queries are answered, and
-   updates validated/run and responded to, from the handlers the body registers.
-   [task_queue] is the worker's default queue, used for scheduled activities and as
-   the fallback for child workflows that don't name one. *)
+(* [queries] are the (query_id, query_type, arguments) of any QueryWorkflow jobs, and
+   [updates] the (protocol_instance_id, run_validator) of any DoUpdate jobs, on this
+   activation (whose Update events apply_job already appended to the log, in job
+   order). When [query_mode] is set (a pure-query activation), the body is replayed
+   read-only: it rebuilds state from history but suppresses every workflow-advancing
+   command. Queries are answered, and updates validated/run and responded to, from the
+   handlers the body registers. [task_queue] is the worker's default queue, used for
+   scheduled activities and as the fallback for child workflows that don't name one. *)
 let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
     ~run_id ~can_suggested ~history_length ~query_mode ~queries ~updates :
     Coresdk.wf_command list =
@@ -41,16 +43,10 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
      commands; the terminal ones (complete/fail/continue-as-new) guard inline. *)
   let emit cmd = if not query_mode then commands := cmd :: !commands in
   let act_seq = ref 0 and timer_seq = ref 0 and child_seq = ref 0 in
-  (* the replay cursor: remaining events in history order. Peek the next event;
-     advance only when the body consumes it. (When signals land, advancing past a
-     signal entry is exactly where its handler will fire.) *)
-  let cursor = ref (List.rev state.events_rev) in
-  let peek () = match !cursor with ev :: _ -> Some ev | [] -> None in
-  let advance () = match !cursor with _ :: rest -> cursor := rest | [] -> () in
   (* Signals: handlers the body registers (rebuilt each re-run), plus a per-name
-     buffer for signals the cursor passed before a handler existed. Matches Temporal,
-     which buffers until a handler registers; normally handlers register at the top
-     of the body, before any checkpoint, so nothing is ever buffered. *)
+     buffer for signals the log walk passed before a handler existed. Matches Temporal,
+     which buffers until a handler registers; normally handlers register at the top of
+     the body, before any checkpoint, so nothing is ever buffered. *)
   let module Signals = struct
     let handlers : (string, Codec.payload -> unit) Hashtbl.t = Hashtbl.create 8
     let buffered : (string, Codec.payload Queue.t) Hashtbl.t = Hashtbl.create 4
@@ -196,136 +192,219 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                 state.events_rev)
         updates
   end in
-  (* deliver signals and updates at the cursor head, advancing past each, until the
-     head is a resolution or the cursor is empty — applying each exactly where it
-     sits relative to the resolutions around it. *)
-  let rec deliver_pending () =
-    match !cursor with
-    | Signal (name, payload) :: rest ->
-      cursor := rest;
-      Signals.deliver name payload;
-      deliver_pending ()
-    | Update { protocol_instance_id; name; input } :: rest ->
-      cursor := rest;
-      Updates.deliver protocol_instance_id name input;
-      deliver_pending ()
-    | _ -> ()
+  let open Effect.Deep in
+  (* emit each operation's command exactly once. The [issued] set lives in run_state,
+     so a re-run within the same cached run does not re-issue an outstanding operation;
+     a query replay neither emits nor records. *)
+  let emit_once key cmd =
+    if (not query_mode) && not (Hashtbl.mem state.issued key) then (
+      Hashtbl.replace state.issued key ();
+      emit cmd)
+  in
+  (* ---- the scheduler --------------------------------------------------- *)
+  (* per-operation waiters keyed by seq. A matching resolution wakes the waiter; while
+     it stays in the table the operation is unresolved. A child awaits in two stages,
+     so it moves from the start table to the completion table when it starts. *)
+  let act_waiters : (int, resolution -> unit) Hashtbl.t = Hashtbl.create 8 in
+  let timer_waiters : (int, unit -> unit) Hashtbl.t = Hashtbl.create 8 in
+  let child_start_waiters : (int, child_start -> unit) Hashtbl.t = Hashtbl.create 8 in
+  let child_result_waiters : (int, resolution -> unit) Hashtbl.t = Hashtbl.create 8 in
+  (* fibers blocked on a predicate, re-checked after each event *)
+  let cond_waiters : ((unit -> bool) * (unit, unit) continuation) list ref = ref [] in
+  (* runnable resumes, drained FIFO so command-issue order is deterministic *)
+  let ready : (unit -> unit) Queue.t = Queue.create () in
+  let run_ready () = while not (Queue.is_empty ready) do (Queue.pop ready) () done in
+  (* after each event, wake any fiber whose predicate now holds *)
+  let wake_conditions () =
+    let woken, still = List.partition (fun (p, _) -> p ()) !cond_waiters in
+    cond_waiters := still;
+    List.iter (fun (_, k) -> Queue.push (fun () -> continue k ()) ready) woken
   in
   let arg =
     match state.init_arg with
     | Some p -> p
     | None -> Codec.to_payload Codec.unit ()
   in
-  let open Effect.Deep in
-  (* activity and child completions resume the same way: continue with the payload,
-     or discontinue with a labelled failure. *)
-  let resume_payload (k : (Codec.payload, unit) continuation) label = function
-    | R_ok payload -> continue k payload
-    | R_fail msg -> discontinue k (Failure (label ^ msg))
+  let dummy = Codec.to_payload Codec.unit () in
+  (* spawned fibers: each has a seq-keyed outcome and one waiter for whoever awaits
+     it. The result value itself rides in the future's own cell (Workflow.spawn); the
+     scheduler only tracks done-or-failed. *)
+  let fiber_seq = ref 0 in
+  let fiber_outcome : (int, (unit, exn) result) Hashtbl.t = Hashtbl.create 8 in
+  let fiber_waiters : (int, (unit, exn) result -> unit) Hashtbl.t = Hashtbl.create 8 in
+  let resolve_fiber id r =
+    Hashtbl.replace fiber_outcome id r;
+    match Hashtbl.find_opt fiber_waiters id with
+    | Some w -> Hashtbl.remove fiber_waiters id; Queue.push (fun () -> w r) ready
+    | None -> ()
   in
-  match_with
-    (fun () ->
-      wf.Workflow.body ~task_queue:default_tq ~workflow_id:state.wf_id ~run_id
-        ~can_suggested ~history_length arg)
-    ()
+  let root_output = ref None in
+  (* the root fiber completing closes the workflow; any other fiber raising also fails
+     it. Catch exceptions in the body (try/with) to compensate and continue (saga). *)
+  let root_done = function
+    | Ok () ->
+      if not query_mode then
+        commands := [ Coresdk.Complete_workflow_execution !root_output ]
+    | Error exn ->
+      let msg = Printexc.to_string exn in
+      if query_mode then
+        Eio.traceln "[wf] workflow raised during query replay: %s" msg
+      else (
+        Eio.traceln "[wf] failing workflow execution: %s" msg;
+        commands := [ Coresdk.Fail_workflow_execution msg ])
+  in
+  (* run one fiber (the root body, or a spawned thunk) under the shared handler.
+     [on_done] gets Ok () on normal completion, Error on an uncaught raise. *)
+  let rec run_fiber (on_done : (unit, exn) result -> unit) (thunk : unit -> unit) =
+    match_with thunk ()
     {
-      retc =
-        (fun (output : Codec.payload) ->
-          (* a read-only query replay must not (re-)complete the workflow *)
-          if not query_mode then
-            commands := [ Coresdk.Complete_workflow_execution (Some output) ]);
-      exnc =
-        (fun exn ->
-          (* an uncaught exception in the workflow body fails the execution;
-             catch it in the body (try/with) to compensate and continue (saga) *)
-          let msg = Printexc.to_string exn in
-          if query_mode then
-            Eio.traceln "[wf] workflow raised during query replay: %s" msg
-          else (
-            Eio.traceln "[wf] failing workflow execution: %s" msg;
-            commands := [ Coresdk.Fail_workflow_execution msg ]));
+      retc = (fun () -> on_done (Ok ()));
+      exnc = (fun exn -> on_done (Error exn));
       effc =
         (fun (type a) (eff : a Effect.t) ->
           match eff with
-          | Workflow.Schedule_activity_effect
+          | Workflow.Start_activity_effect
               { activity_type; arg; start_to_close; max_attempts } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr act_seq;
                 let s = !act_seq in
-                deliver_pending ();
-                match peek () with
-                | Some (Activity_resolved (s', r)) when s' = s ->
-                  advance ();
-                  resume_payload k "activity failed: " r
-                | _ ->
-                  (* not resolved yet: schedule it and suspend this run *)
-                  emit
-                    (Coresdk.Schedule_activity
-                       {
-                         seq = s;
-                         activity_id = string_of_int s;
-                         activity_type;
-                         task_queue = default_tq;
-                         arguments = [ arg ];
-                         start_to_close;
-                         max_attempts;
-                       }))
+                emit_once (Printf.sprintf "act:%d" s)
+                  (Coresdk.Schedule_activity
+                     {
+                       seq = s;
+                       activity_id = string_of_int s;
+                       activity_type;
+                       task_queue = default_tq;
+                       arguments = [ arg ];
+                       start_to_close;
+                       max_attempts;
+                       cancellation_type = 0 (* TRY_CANCEL; real value arrives with activity cancel types *);
+                     });
+                continue k (Workflow.Op_activity s))
           | Workflow.Start_timer_effect { start_to_fire } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr timer_seq;
                 let s = !timer_seq in
-                deliver_pending ();
-                match peek () with
-                | Some (Timer_fired s') when s' = s -> advance (); continue k ()
-                | _ -> emit (Coresdk.Start_timer { seq = s; start_to_fire }))
-          | Workflow.Execute_child_workflow_effect
+                emit_once (Printf.sprintf "timer:%d" s)
+                  (Coresdk.Start_timer { seq = s; start_to_fire });
+                continue k (Workflow.Op_timer s))
+          | Workflow.Start_child_effect
               { workflow_id; workflow_type; input; task_queue; parent_close_policy;
                 execution_timeout; run_timeout } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr child_seq;
                 let s = !child_seq in
-                deliver_pending ();
-                (* a child resolves twice: first its start (run id, or a start
-                   failure), then its completion. Consume both from the log; if only
-                   the start is present the child is still running, so suspend. *)
-                match peek () with
-                | Some (Child_started (s', Child_start_fail msg)) when s' = s ->
-                  advance ();
-                  discontinue k (Failure ("child workflow start failed: " ^ msg))
-                | Some (Child_started (s', Child_run _run_id)) when s' = s ->
-                  advance ();
-                  deliver_pending ();
-                  (match peek () with
-                   | Some (Child_resolved (s'', r)) when s'' = s ->
-                     advance ();
-                     resume_payload k "child workflow failed: " r
-                   | _ -> () (* started, still running: suspend *))
-                | _ ->
-                  (* not started yet: emit the start command and suspend *)
-                  let wid =
-                    match workflow_id with
-                    | Some id -> id
-                    | None -> Printf.sprintf "%s/%d" state.wf_id s
+                let wid =
+                  match workflow_id with
+                  | Some id -> id
+                  | None -> Printf.sprintf "%s/%d" state.wf_id s
+                in
+                let tq = match task_queue with Some q -> q | None -> default_tq in
+                emit_once (Printf.sprintf "child:%d" s)
+                  (Coresdk.Start_child_workflow_execution
+                     {
+                       seq = s;
+                       namespace = "";
+                       workflow_id = wid;
+                       workflow_type;
+                       task_queue = tq;
+                       input = [ input ];
+                       execution_timeout;
+                       run_timeout;
+                       parent_close_policy;
+                     });
+                continue k (Workflow.Op_child s))
+          | Workflow.Await_effect op ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                (* park on [op]; on resolution resume with the payload, or discontinue
+                   with a labelled failure. A child awaits in two stages. *)
+                let ok p = continue k p
+                and fail label msg = discontinue k (Failure (label ^ msg)) in
+                match op with
+                | Workflow.Op_activity s ->
+                  Hashtbl.replace act_waiters s (fun r ->
+                      Hashtbl.remove act_waiters s;
+                      match r with R_ok p -> ok p | R_fail msg -> fail "activity failed: " msg)
+                | Workflow.Op_timer s ->
+                  Hashtbl.replace timer_waiters s (fun () ->
+                      Hashtbl.remove timer_waiters s;
+                      ok (Codec.to_payload Codec.unit ()))
+                | Workflow.Op_child s ->
+                  Hashtbl.replace child_start_waiters s (fun cs ->
+                      Hashtbl.remove child_start_waiters s;
+                      match cs with
+                      | Child_start_fail msg -> fail "child workflow start failed: " msg
+                      | Child_run _run_id ->
+                        Hashtbl.replace child_result_waiters s (fun r ->
+                            Hashtbl.remove child_result_waiters s;
+                            match r with
+                            | R_ok p -> ok p
+                            | R_fail msg -> fail "child workflow failed: " msg))
+                | Workflow.Op_fiber id ->
+                  let wake = function
+                    | Ok () -> ok dummy
+                    | Error exn -> discontinue k exn
                   in
-                  let tq =
-                    match task_queue with Some q -> q | None -> default_tq
-                  in
-                  emit
-                    (Coresdk.Start_child_workflow_execution
-                       {
-                         seq = s;
-                         namespace = "";
-                         workflow_id = wid;
-                         workflow_type;
-                         task_queue = tq;
-                         input = [ input ];
-                         execution_timeout;
-                         run_timeout;
-                         parent_close_policy;
-                       }))
+                  (match Hashtbl.find_opt fiber_outcome id with
+                   | Some r -> wake r
+                   | None -> Hashtbl.replace fiber_waiters id wake))
+          | Workflow.Await_any_effect ops ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                (* park on every op; the first to resolve wakes the fiber with its
+                   index and payload, and the rest become no-ops *)
+                let resolved = ref false in
+                let wake idx r =
+                  if not !resolved then (
+                    resolved := true;
+                    match r with
+                    | R_ok p -> continue k (idx, p)
+                    | R_fail msg ->
+                      discontinue k (Failure ("awaited operation failed: " ^ msg)))
+                in
+                List.iteri
+                  (fun idx op ->
+                    match op with
+                    | Workflow.Op_activity s ->
+                      Hashtbl.replace act_waiters s (fun r ->
+                          Hashtbl.remove act_waiters s;
+                          wake idx r)
+                    | Workflow.Op_timer s ->
+                      Hashtbl.replace timer_waiters s (fun () ->
+                          Hashtbl.remove timer_waiters s;
+                          wake idx (R_ok (Codec.to_payload Codec.unit ())))
+                    | Workflow.Op_child s ->
+                      Hashtbl.replace child_start_waiters s (fun cs ->
+                          Hashtbl.remove child_start_waiters s;
+                          match cs with
+                          | Child_start_fail msg ->
+                            wake idx (R_fail ("child workflow start failed: " ^ msg))
+                          | Child_run _run_id ->
+                            Hashtbl.replace child_result_waiters s (fun r ->
+                                Hashtbl.remove child_result_waiters s;
+                                wake idx r))
+                    | Workflow.Op_fiber id ->
+                      let wake_f = function
+                        | Ok () -> wake idx (R_ok dummy)
+                        | Error exn -> wake idx (R_fail (Printexc.to_string exn))
+                      in
+                      (match Hashtbl.find_opt fiber_outcome id with
+                       | Some r -> wake_f r
+                       | None -> Hashtbl.replace fiber_waiters id wake_f))
+                  ops)
+          | Workflow.Spawn_effect thunk ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                incr fiber_seq;
+                let id = !fiber_seq in
+                (* the child runs when the ready queue next drains; the parent
+                   continues immediately *)
+                Queue.push (fun () -> run_fiber (resolve_fiber id) thunk) ready;
+                continue k (Workflow.Op_fiber id))
           | Workflow.Continue_as_new_effect new_arg ->
             Some
               (fun (_ : (a, unit) continuation) ->
@@ -352,16 +431,49 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
           | Workflow.Wait_condition_effect pred ->
             Some
               (fun (k : (a, unit) continuation) ->
-                deliver_pending ();
+                (* true now: resume inline. false: park on the predicate for the log
+                   walk to re-check after each event. *)
                 if pred () then continue k ()
-                else () (* condition false: suspend, emit no command *))
+                else cond_waiters := (pred, k) :: !cond_waiters)
           | _ -> None);
-    };
-  (* flush any signals/updates still at the frontier that no checkpoint reached
-     (e.g. the body completed without a trailing wait_condition) so an arrived
-     update always gets a response. Already-delivered events were advanced past, so
-     this only fires stragglers. *)
-  deliver_pending ();
+    }
+  in
+  run_fiber root_done
+    (fun () ->
+      root_output :=
+        Some
+          (wf.Workflow.body ~task_queue:default_tq ~workflow_id:state.wf_id ~run_id
+             ~can_suggested ~history_length arg));
+  run_ready ();
+  (* drive the accumulated history log in order. A resolution wakes its waiter (via
+     the ready queue, so resumes run FIFO); a signal or update delivers to its
+     handlers; after each event any predicate that now holds is woken. *)
+  List.iter
+    (fun ev ->
+      (match ev with
+       | Activity_resolved (seq, r) -> (
+         match Hashtbl.find_opt act_waiters seq with
+         | Some w -> Queue.push (fun () -> w r) ready
+         | None -> ())
+       | Timer_fired seq -> (
+         match Hashtbl.find_opt timer_waiters seq with
+         | Some w -> Queue.push (fun () -> w ()) ready
+         | None -> ())
+       | Child_started (seq, cs) -> (
+         match Hashtbl.find_opt child_start_waiters seq with
+         | Some w -> Queue.push (fun () -> w cs) ready
+         | None -> ())
+       | Child_resolved (seq, r) -> (
+         match Hashtbl.find_opt child_result_waiters seq with
+         | Some w -> Queue.push (fun () -> w r) ready
+         | None -> ())
+       | Signal (name, payload) -> Signals.deliver name payload
+       | Update { protocol_instance_id; name; input } ->
+         Updates.deliver protocol_instance_id name input);
+      run_ready ();
+      wake_conditions ();
+      run_ready ())
+    (List.rev state.events_rev);
   (* answer queries and emit update responses from the handlers/outcomes the replay
      built, then drop any rejected update's event so the log stays consistent with
      what core replays after an eviction. *)
