@@ -471,6 +471,121 @@ let () =
      | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "A+B"
      | _ -> false)
 
+(* cancellation: canceling a scope emits the cancel command for an activity started
+   under it. The cancel and the workflow's completion fall in different activations,
+   so the Request_cancel is observable (a terminal command replaces the list). *)
+let () =
+  let go = Signal.define ~name:"go" Codec.unit in
+  let finish = Signal.define ~name:"finish" Codec.unit in
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"CancelReqW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let started = ref false and done_ = ref false in
+           Workflow.on_signal ctx go (fun () -> started := true);
+           Workflow.on_signal ctx finish (fun () -> done_ := true);
+           Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+               let _a = Workflow.start_activity ctx' echo_act "A" in
+               Workflow.wait_condition ctx (fun () -> !started);
+               cancel ();
+               Workflow.wait_condition ctx (fun () -> !done_);
+               "done")))
+  in
+  let run_id = "wf-cancel-req" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"CancelReqW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "cancel: schedules the activity, then blocks"
+    (match c1 with [ Coresdk.Schedule_activity { seq = 1; _ } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "go"; input = [ unit_arg ] });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "cancel: canceling the scope requests activity cancellation"
+    (match c2 with [ Coresdk.Request_cancel_activity { seq = 1 } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "finish"; input = [ unit_arg ] });
+  let c3 = activation wf st ~run_id ~history_length:3 in
+  check "cancel: completes once released"
+    (match c3 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "done"
+     | _ -> false)
+
+(* cancellation: awaiting an operation whose scope is already cancelled raises Canceled
+   at the await point. Canceled is an ordinary exception, so the body catches it and
+   completes normally (a denied cancel). *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"CancelCatchW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+               let a = Workflow.start_activity ctx' echo_act "A" in
+               cancel ();
+               try Workflow.await ctx' a with Workflow.Canceled _ -> "denied")))
+  in
+  let run_id = "wf-cancel-catch" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"CancelCatchW" ~workflow_id:run_id [ unit_arg ]);
+  let c = activation wf st ~run_id ~history_length:1 in
+  check "cancel: await under a cancelled scope raises Canceled, caught and denied"
+    (match c with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "denied"
+     | _ -> false)
+
+(* cancellation: canceling one scope leaves a sibling scope's operation untouched. The
+   activity started under the live scope is scheduled (not cancelled) and its await
+   resolves normally. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"SiblingScopeW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let a =
+             Workflow.with_cancel_scope ctx (fun ctx_a ~cancel:_ ->
+                 Workflow.start_activity ctx_a echo_act "A")
+           in
+           Workflow.with_cancel_scope ctx (fun _ctx_b ~cancel -> cancel ());
+           Workflow.await ctx a))
+  in
+  let run_id = "wf-sibling-scope" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"SiblingScopeW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "cancel: a sibling scope's cancel emits nothing for the live scope's activity"
+    (match c1 with [ Coresdk.Schedule_activity { seq = 1; _ } ] -> true | _ -> false);
+  Replay_state.apply_job st
+    (Coresdk.Resolve_activity
+       { seq = 1; result = Coresdk.Completed (Some (Codec.to_payload Codec.string "A")) });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "cancel: the live scope's activity resolves normally"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "A"
+     | _ -> false)
+
+(* cancellation: is_cancel_requested reflects the scope's state before and after a
+   cancel, for cooperative checks *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"CancelProbeW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+               let before = Workflow.is_cancel_requested ctx' in
+               cancel ();
+               let after = Workflow.is_cancel_requested ctx' in
+               Printf.sprintf "before=%b after=%b" before after)))
+  in
+  let run_id = "wf-cancel-probe" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"CancelProbeW" ~workflow_id:run_id [ unit_arg ]);
+  let c = activation wf st ~run_id ~history_length:1 in
+  check "cancel: is_cancel_requested flips false -> true across a cancel"
+    (match c with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "before=false after=true"
+     | _ -> false)
+
 let () =
   if !failures > 0 then (
     Printf.printf "%d replay test(s) failed\n" !failures;

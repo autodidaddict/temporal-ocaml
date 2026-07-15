@@ -206,6 +206,19 @@ module Workflow : sig
       independent concurrent control flow; to fan out operations, [start_*] plus
       {!await_all} is simpler. *)
 
+  exception Canceled of string
+  (** Raised at an await point inside a cancelled scope. Catch it to compensate and
+      re-raise to propagate the cancel, or return normally to deny it. *)
+
+  val with_cancel_scope : 'i ctx -> ('i ctx -> cancel:(unit -> unit) -> 'a) -> 'a
+  (** [with_cancel_scope ctx (fun ctx' ~cancel -> ...)] runs the body in a fresh
+      cancellable child scope. [cancel ()] cancels every operation started under
+      [ctx'], emitting its cancel command and raising {!Canceled} in fibers awaiting
+      it; an await under an already-cancelled scope raises at once. *)
+
+  val is_cancel_requested : _ ctx -> bool
+  (** whether the current scope has been asked to cancel, for cooperative checks *)
+
   val on_signal : _ ctx -> 'a Signal.t -> ('a -> unit) -> unit
   (** [on_signal ctx signal handler] runs [handler] whenever [signal] is
       received. The handler runs synchronously and typically mutates state the

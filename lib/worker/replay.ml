@@ -220,6 +220,46 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
     cond_waiters := still;
     List.iter (fun (_, k) -> Queue.push (fun () -> continue k ()) ready) woken
   in
+  (* ---- cancellation scopes --------------------------------------------- *)
+  (* scope 0 is the root. A non-detached child inherits its parent's cancellation; a
+     detached one does not (it has no recorded parent). *)
+  let scope_seq = ref 0 in
+  let scope_parent : (int, int) Hashtbl.t = Hashtbl.create 8 in
+  let cancelled_scopes : (int, unit) Hashtbl.t = Hashtbl.create 8 in
+  let rec is_cancelled sc =
+    Hashtbl.mem cancelled_scopes sc
+    ||
+    match Hashtbl.find_opt scope_parent sc with
+    | Some p -> is_cancelled p
+    | None -> false
+  in
+  (* every started activity/timer/child is cancellable until it resolves. [op_scope]
+     records the scope it ran under, [cancel_cmd] the command to cancel it, and
+     [cancel_hook] (present once the op is awaited) discontinues the parked fiber with
+     Canceled. Keys are "act:seq" / "timer:seq" / "child:seq". *)
+  let op_scope : (string, int) Hashtbl.t = Hashtbl.create 8 in
+  let cancel_cmd : (string, Coresdk.wf_command) Hashtbl.t = Hashtbl.create 8 in
+  let cancel_hook : (string, unit -> unit) Hashtbl.t = Hashtbl.create 8 in
+  let track_op key scope cmd =
+    Hashtbl.replace op_scope key scope;
+    Hashtbl.replace cancel_cmd key cmd
+  in
+  let untrack_op key =
+    Hashtbl.remove cancel_cmd key;
+    Hashtbl.remove cancel_hook key
+  in
+  let do_cancel sc =
+    Hashtbl.replace cancelled_scopes sc ();
+    (* copy: cancel_cmd/cancel_hook are removed while iterating *)
+    Hashtbl.iter
+      (fun key cmd ->
+        if is_cancelled (Hashtbl.find op_scope key) then (
+          emit_once ("cancel-" ^ key) cmd;
+          (match Hashtbl.find_opt cancel_hook key with Some h -> h () | None -> ());
+          Hashtbl.remove cancel_cmd key;
+          Hashtbl.remove cancel_hook key))
+      (Hashtbl.copy cancel_cmd)
+  in
   let arg =
     match state.init_arg with
     | Some p -> p
@@ -245,6 +285,13 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
     | Ok () ->
       if not query_mode then
         commands := [ Coresdk.Complete_workflow_execution !root_output ]
+    | Error (Workflow.Canceled reason) ->
+      (* the root scope was cancelled and the body did not deny it: close as canceled *)
+      if query_mode then
+        Eio.traceln "[wf] workflow canceled during query replay: %s" reason
+      else (
+        Eio.traceln "[wf] workflow canceled: %s" reason;
+        commands := [ Coresdk.Cancel_workflow_execution ])
     | Error exn ->
       let msg = Printexc.to_string exn in
       if query_mode then
@@ -264,12 +311,13 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
         (fun (type a) (eff : a Effect.t) ->
           match eff with
           | Workflow.Start_activity_effect
-              { activity_type; arg; start_to_close; max_attempts } ->
+              { scope; activity_type; arg; start_to_close; max_attempts } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr act_seq;
                 let s = !act_seq in
-                emit_once (Printf.sprintf "act:%d" s)
+                let key = Printf.sprintf "act:%d" s in
+                emit_once key
                   (Coresdk.Schedule_activity
                      {
                        seq = s;
@@ -281,29 +329,32 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                        max_attempts;
                        cancellation_type = 0 (* TRY_CANCEL; real value arrives with activity cancel types *);
                      });
+                track_op key scope (Coresdk.Request_cancel_activity { seq = s });
                 continue k (Workflow.Op_activity s))
-          | Workflow.Start_timer_effect { start_to_fire } ->
+          | Workflow.Start_timer_effect { scope; start_to_fire } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr timer_seq;
                 let s = !timer_seq in
-                emit_once (Printf.sprintf "timer:%d" s)
-                  (Coresdk.Start_timer { seq = s; start_to_fire });
+                let key = Printf.sprintf "timer:%d" s in
+                emit_once key (Coresdk.Start_timer { seq = s; start_to_fire });
+                track_op key scope (Coresdk.Cancel_timer { seq = s });
                 continue k (Workflow.Op_timer s))
           | Workflow.Start_child_effect
-              { workflow_id; workflow_type; input; task_queue; parent_close_policy;
-                execution_timeout; run_timeout } ->
+              { scope; workflow_id; workflow_type; input; task_queue;
+                parent_close_policy; execution_timeout; run_timeout } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr child_seq;
                 let s = !child_seq in
+                let key = Printf.sprintf "child:%d" s in
                 let wid =
                   match workflow_id with
                   | Some id -> id
                   | None -> Printf.sprintf "%s/%d" state.wf_id s
                 in
                 let tq = match task_queue with Some q -> q | None -> default_tq in
-                emit_once (Printf.sprintf "child:%d" s)
+                emit_once key
                   (Coresdk.Start_child_workflow_execution
                      {
                        seq = s;
@@ -316,34 +367,72 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                        run_timeout;
                        parent_close_policy;
                      });
+                track_op key scope
+                  (Coresdk.Cancel_child_workflow_execution
+                     { child_workflow_seq = s; reason = "" });
                 continue k (Workflow.Op_child s))
           | Workflow.Await_effect op ->
             Some
               (fun (k : (a, unit) continuation) ->
                 (* park on [op]; on resolution resume with the payload, or discontinue
-                   with a labelled failure. A child awaits in two stages. *)
+                   with a labelled failure. A cancellable op (activity/timer/child)
+                   raises Canceled if its scope is already cancelled, or later if a
+                   cancel reaches it while parked. A child awaits in two stages. *)
                 let ok p = continue k p
                 and fail label msg = discontinue k (Failure (label ^ msg)) in
+                let park_cancellable key ~remove_waiter ~register_waiter =
+                  if is_cancelled (Hashtbl.find op_scope key) then
+                    discontinue k (Workflow.Canceled "scope canceled")
+                  else (
+                    register_waiter ();
+                    Hashtbl.replace cancel_hook key (fun () ->
+                        remove_waiter ();
+                        Queue.push
+                          (fun () ->
+                            discontinue k (Workflow.Canceled "scope canceled"))
+                          ready))
+                in
                 match op with
                 | Workflow.Op_activity s ->
-                  Hashtbl.replace act_waiters s (fun r ->
-                      Hashtbl.remove act_waiters s;
-                      match r with R_ok p -> ok p | R_fail msg -> fail "activity failed: " msg)
+                  let key = Printf.sprintf "act:%d" s in
+                  park_cancellable key
+                    ~remove_waiter:(fun () -> Hashtbl.remove act_waiters s)
+                    ~register_waiter:(fun () ->
+                      Hashtbl.replace act_waiters s (fun r ->
+                          Hashtbl.remove act_waiters s;
+                          untrack_op key;
+                          match r with
+                          | R_ok p -> ok p
+                          | R_fail msg -> fail "activity failed: " msg))
                 | Workflow.Op_timer s ->
-                  Hashtbl.replace timer_waiters s (fun () ->
-                      Hashtbl.remove timer_waiters s;
-                      ok (Codec.to_payload Codec.unit ()))
+                  let key = Printf.sprintf "timer:%d" s in
+                  park_cancellable key
+                    ~remove_waiter:(fun () -> Hashtbl.remove timer_waiters s)
+                    ~register_waiter:(fun () ->
+                      Hashtbl.replace timer_waiters s (fun () ->
+                          Hashtbl.remove timer_waiters s;
+                          untrack_op key;
+                          ok (Codec.to_payload Codec.unit ())))
                 | Workflow.Op_child s ->
-                  Hashtbl.replace child_start_waiters s (fun cs ->
+                  let key = Printf.sprintf "child:%d" s in
+                  park_cancellable key
+                    ~remove_waiter:(fun () ->
                       Hashtbl.remove child_start_waiters s;
-                      match cs with
-                      | Child_start_fail msg -> fail "child workflow start failed: " msg
-                      | Child_run _run_id ->
-                        Hashtbl.replace child_result_waiters s (fun r ->
-                            Hashtbl.remove child_result_waiters s;
-                            match r with
-                            | R_ok p -> ok p
-                            | R_fail msg -> fail "child workflow failed: " msg))
+                      Hashtbl.remove child_result_waiters s)
+                    ~register_waiter:(fun () ->
+                      Hashtbl.replace child_start_waiters s (fun cs ->
+                          Hashtbl.remove child_start_waiters s;
+                          match cs with
+                          | Child_start_fail msg ->
+                            untrack_op key;
+                            fail "child workflow start failed: " msg
+                          | Child_run _run_id ->
+                            Hashtbl.replace child_result_waiters s (fun r ->
+                                Hashtbl.remove child_result_waiters s;
+                                untrack_op key;
+                                match r with
+                                | R_ok p -> ok p
+                                | R_fail msg -> fail "child workflow failed: " msg)))
                 | Workflow.Op_fiber id ->
                   let wake = function
                     | Ok () -> ok dummy
@@ -405,6 +494,19 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                    continues immediately *)
                 Queue.push (fun () -> run_fiber (resolve_fiber id) thunk) ready;
                 continue k (Workflow.Op_fiber id))
+          | Workflow.New_scope_effect { parent; detached } ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                incr scope_seq;
+                let sid = !scope_seq in
+                (* a non-detached scope records its parent so cancellation inherits;
+                   a detached one does not *)
+                if not detached then Hashtbl.replace scope_parent sid parent;
+                continue k sid)
+          | Workflow.Cancel_scope_effect sc ->
+            Some (fun (k : (a, unit) continuation) -> do_cancel sc; continue k ())
+          | Workflow.Cancel_requested_effect sc ->
+            Some (fun (k : (a, unit) continuation) -> continue k (is_cancelled sc))
           | Workflow.Continue_as_new_effect new_arg ->
             Some
               (fun (_ : (a, unit) continuation) ->
