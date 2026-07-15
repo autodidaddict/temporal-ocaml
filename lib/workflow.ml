@@ -169,6 +169,33 @@ let with_cancel_scope (ctx : 'i ctx) (f : 'i ctx -> cancel:(unit -> unit) -> 'a)
   let cancel () = Effect.perform (Cancel_scope_effect sid) in
   f { ctx with scope = sid } ~cancel
 
+(* run [f] in a detached child scope. Ancestor cancellation does not reach a detached
+   scope, so post-cancel cleanup started under it runs to completion. *)
+let detached (ctx : 'i ctx) (f : 'i ctx -> 'a) : 'a =
+  let sid = Effect.perform (New_scope_effect { parent = ctx.scope; detached = true }) in
+  f { ctx with scope = sid }
+
+(* run [f] in a fresh child scope that auto-cancels after [seconds]. A watcher fiber
+   sleeps the deadline in a sibling scope; when it fires it cancels the body scope,
+   raising Canceled in [f]. When [f] finishes first, its deadline timer is cancelled.
+   Canceled from a fired deadline propagates out, for the caller to handle. *)
+let with_timeout (ctx : 'i ctx) (seconds : float) (f : 'i ctx -> 'a) : 'a =
+  let body_scope =
+    Effect.perform (New_scope_effect { parent = ctx.scope; detached = false })
+  in
+  let timer_scope =
+    Effect.perform (New_scope_effect { parent = ctx.scope; detached = false })
+  in
+  let ctx_timer = { ctx with scope = timer_scope } in
+  let (_ : unit future) =
+    spawn ctx_timer (fun () ->
+        sleep ctx_timer seconds;
+        Effect.perform (Cancel_scope_effect body_scope))
+  in
+  Fun.protect
+    ~finally:(fun () -> Effect.perform (Cancel_scope_effect timer_scope))
+    (fun () -> f { ctx with scope = body_scope })
+
 (* whether the current scope has been asked to cancel; for cooperative checks *)
 let is_cancel_requested (ctx : _ ctx) : bool =
   Effect.perform (Cancel_requested_effect ctx.scope)
@@ -210,6 +237,29 @@ let on_signal (_ : _ ctx) (s : 'a Signal.t) (handler : 'a -> unit) : unit =
 
 let wait_condition (_ : _ ctx) (pred : unit -> bool) : unit =
   Effect.perform (Wait_condition_effect pred)
+
+(* block until [pred] holds or [timeout] seconds elapse; return whether it held in
+   time. A watcher fiber sleeps the deadline in a child scope and flips a flag the
+   predicate reads; when [pred] wins first the deadline timer is cancelled. *)
+let wait_condition_timeout (ctx : _ ctx) ~(timeout : float) (pred : unit -> bool) :
+    bool =
+  if pred () then true
+  else begin
+    let timer_scope =
+      Effect.perform (New_scope_effect { parent = ctx.scope; detached = false })
+    in
+    let ctx_timer = { ctx with scope = timer_scope } in
+    let timed_out = ref false in
+    let (_ : unit future) =
+      spawn ctx_timer (fun () ->
+          sleep ctx_timer timeout;
+          timed_out := true)
+    in
+    wait_condition ctx (fun () -> pred () || !timed_out);
+    let met = pred () in
+    Effect.perform (Cancel_scope_effect timer_scope);
+    met
+  end
 
 (* on_query registers a read-only handler (the query's decoder and encoder wrapped
    around the user's callback). The worker collects these while replaying the body

@@ -586,6 +586,155 @@ let () =
        Codec.of_payload Codec.string p = "before=false after=true"
      | _ -> false)
 
+(* Phase 5: with_timeout, detached, wait_condition_timeout. A release signal parks the
+   root after the interesting cancel, so the intermediate command is observable (a
+   terminal command otherwise replaces the list). *)
+let release_sig = Signal.define ~name:"release" Codec.unit
+let go_sig = Signal.define ~name:"go" Codec.unit
+
+(* with_timeout: one body-scope activity raced against a deadline timer. Deadline first
+   cancels the activity; body first cancels the timer. Same workflow, two histories. *)
+let timeout_wf =
+  Workflow.reg
+    (Workflow.define ~name:"TimeoutW" ~input:Codec.unit ~output:Codec.string
+       (fun ctx () ->
+         let released = ref false in
+         Workflow.on_signal ctx release_sig (fun () -> released := true);
+         let outcome =
+           match
+             Workflow.with_timeout ctx 30. (fun c -> Workflow.execute_activity c echo_act "A")
+           with
+           | r -> r
+           | exception Workflow.Canceled _ -> "timed-out"
+         in
+         Workflow.wait_condition ctx (fun () -> !released);
+         outcome))
+
+let () =
+  let run_id = "wf-timeout-fire" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"TimeoutW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation timeout_wf st ~run_id ~history_length:1 in
+  check "with_timeout: schedules the body activity and a deadline timer"
+    (match c1 with
+     | [ Coresdk.Schedule_activity { seq = 1; _ };
+         Coresdk.Start_timer { seq = 1; start_to_fire } ] ->
+       start_to_fire = 30.
+     | _ -> false);
+  Replay_state.apply_job st (Coresdk.Fire_timer { seq = 1 });
+  let c2 = activation timeout_wf st ~run_id ~history_length:2 in
+  check "with_timeout: deadline fires, cancels the body activity"
+    (match c2 with [ Coresdk.Request_cancel_activity { seq = 1 } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "release"; input = [ unit_arg ] });
+  let c3 = activation timeout_wf st ~run_id ~history_length:3 in
+  check "with_timeout: body observes Canceled from the deadline"
+    (match c3 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "timed-out"
+     | _ -> false)
+
+let () =
+  let run_id = "wf-timeout-ok" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"TimeoutW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation timeout_wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st
+    (Coresdk.Resolve_activity
+       { seq = 1; result = Coresdk.Completed (Some (Codec.to_payload Codec.string "A")) });
+  let c2 = activation timeout_wf st ~run_id ~history_length:2 in
+  check "with_timeout: body finishes first, cancels the deadline timer"
+    (match c2 with [ Coresdk.Cancel_timer { seq = 1 } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "release"; input = [ unit_arg ] });
+  let c3 = activation timeout_wf st ~run_id ~history_length:3 in
+  check "with_timeout: returns the body result when it beats the deadline"
+    (match c3 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "A"
+     | _ -> false)
+
+(* detached: an activity started in a detached child scope is not reached when an
+   ancestor scope is cancelled, so its await resolves normally. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"DetachedW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let go = ref false in
+           Workflow.on_signal ctx go_sig (fun () -> go := true);
+           let d =
+             Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+                 let d = Workflow.detached ctx' (fun cd -> Workflow.start_activity cd echo_act "D") in
+                 Workflow.wait_condition ctx (fun () -> !go);
+                 cancel ();
+                 d)
+           in
+           Workflow.await ctx d))
+  in
+  let run_id = "wf-detached" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"DetachedW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "detached: schedules the detached activity"
+    (match c1 with [ Coresdk.Schedule_activity { seq = 1; _ } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "go"; input = [ unit_arg ] });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "detached: canceling the ancestor scope emits nothing for the detached op" (c2 = []);
+  Replay_state.apply_job st
+    (Coresdk.Resolve_activity
+       { seq = 1; result = Coresdk.Completed (Some (Codec.to_payload Codec.string "D")) });
+  let c3 = activation wf st ~run_id ~history_length:3 in
+  check "detached: the detached activity resolves normally, unaffected by the cancel"
+    (match c3 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "D"
+     | _ -> false)
+
+(* wait_condition_timeout: predicate met before the deadline returns true and cancels
+   the timer; the deadline firing first returns false. Same workflow, two histories. *)
+let wct_wf =
+  Workflow.reg
+    (Workflow.define ~name:"WctW" ~input:Codec.unit ~output:Codec.string
+       (fun ctx () ->
+         let ok = ref false and released = ref false in
+         Workflow.on_signal ctx go_sig (fun () -> ok := true);
+         Workflow.on_signal ctx release_sig (fun () -> released := true);
+         let met = Workflow.wait_condition_timeout ctx ~timeout:30. (fun () -> !ok) in
+         Workflow.wait_condition ctx (fun () -> !released);
+         Printf.sprintf "met=%b" met))
+
+let () =
+  let run_id = "wf-wct-met" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"WctW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wct_wf st ~run_id ~history_length:1 in
+  check "wait_condition_timeout: starts the deadline timer"
+    (match c1 with [ Coresdk.Start_timer { seq = 1; start_to_fire } ] -> start_to_fire = 30. | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "go"; input = [ unit_arg ] });
+  let c2 = activation wct_wf st ~run_id ~history_length:2 in
+  check "wait_condition_timeout: predicate met cancels the deadline timer"
+    (match c2 with [ Coresdk.Cancel_timer { seq = 1 } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "release"; input = [ unit_arg ] });
+  let c3 = activation wct_wf st ~run_id ~history_length:3 in
+  check "wait_condition_timeout: returns true when the predicate held in time"
+    (match c3 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "met=true"
+     | _ -> false)
+
+let () =
+  let run_id = "wf-wct-timeout" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"WctW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wct_wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st (Coresdk.Fire_timer { seq = 1 });
+  let c2 = activation wct_wf st ~run_id ~history_length:2 in
+  check "wait_condition_timeout: deadline firing emits no further command" (c2 = []);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "release"; input = [ unit_arg ] });
+  let c3 = activation wct_wf st ~run_id ~history_length:3 in
+  check "wait_condition_timeout: returns false when the deadline fired first"
+    (match c3 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "met=false"
+     | _ -> false)
+
 let () =
   if !failures > 0 then (
     Printf.printf "%d replay test(s) failed\n" !failures;

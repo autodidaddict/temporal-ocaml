@@ -216,6 +216,17 @@ module Workflow : sig
       [ctx'], emitting its cancel command and raising {!Canceled} in fibers awaiting
       it; an await under an already-cancelled scope raises at once. *)
 
+  val with_timeout : 'i ctx -> float -> ('i ctx -> 'a) -> 'a
+  (** [with_timeout ctx seconds f] runs [f] in a child scope that auto-cancels after
+      [seconds]. If the deadline fires first, the operations [f] is awaiting are
+      cancelled and {!Canceled} is raised in [f], propagating out unless [f] catches
+      it. If [f] finishes first, the deadline timer is cancelled. *)
+
+  val detached : 'i ctx -> ('i ctx -> 'a) -> 'a
+  (** [detached ctx f] runs [f] in a detached child scope. Cancellation of an ancestor
+      scope does not reach a detached scope, so cleanup started under it (for example
+      a compensating activity after a cancel) runs to completion. *)
+
   val is_cancel_requested : _ ctx -> bool
   (** whether the current scope has been asked to cancel, for cooperative checks *)
 
@@ -247,6 +258,11 @@ module Workflow : sig
   (** [wait_condition ctx pred] blocks the workflow until [pred ()] holds,
       re-checked after each activation delivers new signals, timers, or activity
       results. *)
+
+  val wait_condition_timeout : _ ctx -> timeout:float -> (unit -> bool) -> bool
+  (** [wait_condition_timeout ctx ~timeout pred] blocks like {!wait_condition} but
+      gives up after [timeout] seconds. It returns [true] if [pred ()] held in time
+      and [false] if the timeout fired first. *)
 
   val continue_as_new : 'input ctx -> 'input -> 'a
   (** [continue_as_new ctx input] ends the current run and atomically starts a
