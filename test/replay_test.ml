@@ -368,6 +368,79 @@ let () =
      | [ Coresdk.Continue_as_new { arguments = [ p ] } ] -> Codec.of_payload Codec.int p = 0
      | _ -> false)
 
+let echo_act = Activity.define ~name:"echo" ~input:Codec.string ~output:Codec.string (fun s -> s)
+
+(* fan-out: two activities started eagerly, then await_all *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"FanW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let a = Workflow.start_activity ctx echo_act "A" in
+           let b = Workflow.start_activity ctx echo_act "B" in
+           String.concat "+" (Workflow.await_all ctx [ a; b ])))
+  in
+  let run_id = "wf-fan" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"FanW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "fan-out: schedules both activities eagerly, in order"
+    (match c1 with
+     | [ Coresdk.Schedule_activity { seq = 1; _ }; Coresdk.Schedule_activity { seq = 2; _ } ] ->
+       true
+     | _ -> false);
+  let ok s = Coresdk.Completed (Some (Codec.to_payload Codec.string s)) in
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 1; result = ok "A" });
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 2; result = ok "B" });
+  let c2 = activation wf st ~run_id ~history_length:3 in
+  check "fan-out: completes with both results, nothing re-scheduled"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "A+B"
+     | _ -> false)
+
+(* emit-once: a signal arriving while an activity is outstanding must not re-schedule *)
+let () =
+  let ping = Signal.define ~name:"ping" Codec.unit in
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"OnceW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           Workflow.on_signal ctx ping (fun () -> ());
+           Workflow.execute_activity ctx echo_act "x"))
+  in
+  let run_id = "wf-once" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"OnceW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "emit-once: schedules on init"
+    (match c1 with [ Coresdk.Schedule_activity { seq = 1; _ } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "ping"; input = [ unit_arg ] });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "emit-once: no re-schedule while the activity is outstanding" (c2 = [])
+
+(* await_any: the first future to resolve wins *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"RaceW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let a = Workflow.start_activity ctx echo_act "A" in
+           let b = Workflow.start_activity ctx echo_act "B" in
+           Workflow.await_any ctx [ a; b ]))
+  in
+  let run_id = "wf-race" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"RaceW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st
+    (Coresdk.Resolve_activity
+       { seq = 2; result = Coresdk.Completed (Some (Codec.to_payload Codec.string "B")) });
+  let c = activation wf st ~run_id ~history_length:2 in
+  check "await_any: the first (and only) to resolve wins"
+    (match c with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "B"
+     | _ -> false)
+
 let () =
   if !failures > 0 then (
     Printf.printf "%d replay test(s) failed\n" !failures;

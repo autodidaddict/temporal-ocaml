@@ -48,6 +48,10 @@ type run_state = {
   mutable wf_id : string; (* this execution's workflow id, from InitializeWorkflow *)
   mutable init_arg : Codec.payload option;
   mutable events_rev : event list; (* history order, newest first (cons to append) *)
+  issued : (string, unit) Hashtbl.t;
+    (* emit-once: keys ("act:seq" / "timer:seq" / "child:seq") of commands already
+       sent, so a re-run does not re-issue an outstanding operation. Rebuilt empty on
+       eviction, so a post-eviction full replay re-emits every command. *)
 }
 
 let runs : (string, run_state) Hashtbl.t = Hashtbl.create 16
@@ -56,7 +60,10 @@ let get_run run_id =
   match Hashtbl.find_opt runs run_id with
   | Some s -> s
   | None ->
-    let s = { wf_name = ""; wf_id = ""; init_arg = None; events_rev = [] } in
+    let s =
+      { wf_name = ""; wf_id = ""; init_arg = None; events_rev = [];
+        issued = Hashtbl.create 16 }
+    in
     Hashtbl.replace runs run_id s;
     s
 

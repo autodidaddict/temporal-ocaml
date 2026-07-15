@@ -193,11 +193,13 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
         updates
   end in
   let open Effect.Deep in
-  (* activity and child completions resume the same way: continue with the payload, or
-     discontinue with a labelled failure. *)
-  let resume_payload (k : (Codec.payload, unit) continuation) label = function
-    | R_ok payload -> continue k payload
-    | R_fail msg -> discontinue k (Failure (label ^ msg))
+  (* emit each operation's command exactly once. The [issued] set lives in run_state,
+     so a re-run within the same cached run does not re-issue an outstanding operation;
+     a query replay neither emits nor records. *)
+  let emit_once key cmd =
+    if (not query_mode) && not (Hashtbl.mem state.issued key) then (
+      Hashtbl.replace state.issued key ();
+      emit cmd)
   in
   (* ---- the scheduler --------------------------------------------------- *)
   (* per-operation waiters keyed by seq. A matching resolution wakes the waiter; while
@@ -212,11 +214,6 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
   (* runnable resumes, drained FIFO so command-issue order is deterministic *)
   let ready : (unit -> unit) Queue.t = Queue.create () in
   let run_ready () = while not (Queue.is_empty ready) do (Queue.pop ready) () done in
-  (* one thunk per parked operation, in issue order (prepended, run reversed). Each
-     emits its schedule/start command if the operation is still parked after the log
-     drive. *)
-  let pending_emits = ref [] in
-  let on_park f = pending_emits := f :: !pending_emits in
   (* after each event, wake any fiber whose predicate now holds *)
   let wake_conditions () =
     let woken, still = List.partition (fun (p, _) -> p ()) !cond_waiters in
@@ -251,40 +248,34 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
       effc =
         (fun (type a) (eff : a Effect.t) ->
           match eff with
-          | Workflow.Schedule_activity_effect
+          | Workflow.Start_activity_effect
               { activity_type; arg; start_to_close; max_attempts } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr act_seq;
                 let s = !act_seq in
-                let cmd =
-                  Coresdk.Schedule_activity
-                    {
-                      seq = s;
-                      activity_id = string_of_int s;
-                      activity_type;
-                      task_queue = default_tq;
-                      arguments = [ arg ];
-                      start_to_close;
-                      max_attempts;
-                      cancellation_type = 0 (* TRY_CANCEL; real value arrives with activity cancel types *);
-                    }
-                in
-                Hashtbl.replace act_waiters s (fun r ->
-                    Hashtbl.remove act_waiters s;
-                    resume_payload k "activity failed: " r);
-                on_park (fun () -> if Hashtbl.mem act_waiters s then emit cmd))
+                emit_once (Printf.sprintf "act:%d" s)
+                  (Coresdk.Schedule_activity
+                     {
+                       seq = s;
+                       activity_id = string_of_int s;
+                       activity_type;
+                       task_queue = default_tq;
+                       arguments = [ arg ];
+                       start_to_close;
+                       max_attempts;
+                       cancellation_type = 0 (* TRY_CANCEL; real value arrives with activity cancel types *);
+                     });
+                continue k (Workflow.Op_activity s))
           | Workflow.Start_timer_effect { start_to_fire } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr timer_seq;
                 let s = !timer_seq in
-                let cmd = Coresdk.Start_timer { seq = s; start_to_fire } in
-                Hashtbl.replace timer_waiters s (fun () ->
-                    Hashtbl.remove timer_waiters s;
-                    continue k ());
-                on_park (fun () -> if Hashtbl.mem timer_waiters s then emit cmd))
-          | Workflow.Execute_child_workflow_effect
+                emit_once (Printf.sprintf "timer:%d" s)
+                  (Coresdk.Start_timer { seq = s; start_to_fire });
+                continue k (Workflow.Op_timer s))
+          | Workflow.Start_child_effect
               { workflow_id; workflow_type; input; task_queue; parent_close_policy;
                 execution_timeout; run_timeout } ->
             Some
@@ -297,33 +288,83 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                   | None -> Printf.sprintf "%s/%d" state.wf_id s
                 in
                 let tq = match task_queue with Some q -> q | None -> default_tq in
-                let cmd =
-                  Coresdk.Start_child_workflow_execution
-                    {
-                      seq = s;
-                      namespace = "";
-                      workflow_id = wid;
-                      workflow_type;
-                      task_queue = tq;
-                      input = [ input ];
-                      execution_timeout;
-                      run_timeout;
-                      parent_close_policy;
-                    }
+                emit_once (Printf.sprintf "child:%d" s)
+                  (Coresdk.Start_child_workflow_execution
+                     {
+                       seq = s;
+                       namespace = "";
+                       workflow_id = wid;
+                       workflow_type;
+                       task_queue = tq;
+                       input = [ input ];
+                       execution_timeout;
+                       run_timeout;
+                       parent_close_policy;
+                     });
+                continue k (Workflow.Op_child s))
+          | Workflow.Await_effect op ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                (* park on [op]; on resolution resume with the payload, or discontinue
+                   with a labelled failure. A child awaits in two stages. *)
+                let ok p = continue k p
+                and fail label msg = discontinue k (Failure (label ^ msg)) in
+                match op with
+                | Workflow.Op_activity s ->
+                  Hashtbl.replace act_waiters s (fun r ->
+                      Hashtbl.remove act_waiters s;
+                      match r with R_ok p -> ok p | R_fail msg -> fail "activity failed: " msg)
+                | Workflow.Op_timer s ->
+                  Hashtbl.replace timer_waiters s (fun () ->
+                      Hashtbl.remove timer_waiters s;
+                      ok (Codec.to_payload Codec.unit ()))
+                | Workflow.Op_child s ->
+                  Hashtbl.replace child_start_waiters s (fun cs ->
+                      Hashtbl.remove child_start_waiters s;
+                      match cs with
+                      | Child_start_fail msg -> fail "child workflow start failed: " msg
+                      | Child_run _run_id ->
+                        Hashtbl.replace child_result_waiters s (fun r ->
+                            Hashtbl.remove child_result_waiters s;
+                            match r with
+                            | R_ok p -> ok p
+                            | R_fail msg -> fail "child workflow failed: " msg)))
+          | Workflow.Await_any_effect ops ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                (* park on every op; the first to resolve wakes the fiber with its
+                   index and payload, and the rest become no-ops *)
+                let resolved = ref false in
+                let wake idx r =
+                  if not !resolved then (
+                    resolved := true;
+                    match r with
+                    | R_ok p -> continue k (idx, p)
+                    | R_fail msg ->
+                      discontinue k (Failure ("awaited operation failed: " ^ msg)))
                 in
-                (* a child resolves twice: its start (run id, or a start failure), then
-                   its completion. On start, either fail the await or re-park it on the
-                   completion; on completion, resume or fail. *)
-                Hashtbl.replace child_start_waiters s (fun cs ->
-                    Hashtbl.remove child_start_waiters s;
-                    match cs with
-                    | Child_start_fail msg ->
-                      discontinue k (Failure ("child workflow start failed: " ^ msg))
-                    | Child_run _run_id ->
-                      Hashtbl.replace child_result_waiters s (fun r ->
-                          Hashtbl.remove child_result_waiters s;
-                          resume_payload k "child workflow failed: " r));
-                on_park (fun () -> if Hashtbl.mem child_start_waiters s then emit cmd))
+                List.iteri
+                  (fun idx op ->
+                    match op with
+                    | Workflow.Op_activity s ->
+                      Hashtbl.replace act_waiters s (fun r ->
+                          Hashtbl.remove act_waiters s;
+                          wake idx r)
+                    | Workflow.Op_timer s ->
+                      Hashtbl.replace timer_waiters s (fun () ->
+                          Hashtbl.remove timer_waiters s;
+                          wake idx (R_ok (Codec.to_payload Codec.unit ())))
+                    | Workflow.Op_child s ->
+                      Hashtbl.replace child_start_waiters s (fun cs ->
+                          Hashtbl.remove child_start_waiters s;
+                          match cs with
+                          | Child_start_fail msg ->
+                            wake idx (R_fail ("child workflow start failed: " ^ msg))
+                          | Child_run _run_id ->
+                            Hashtbl.replace child_result_waiters s (fun r ->
+                                Hashtbl.remove child_result_waiters s;
+                                wake idx r)))
+                  ops)
           | Workflow.Continue_as_new_effect new_arg ->
             Some
               (fun (_ : (a, unit) continuation) ->
@@ -386,9 +427,6 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
       wake_conditions ();
       run_ready ())
     (List.rev state.events_rev);
-  (* operations still parked (unresolved this activation) emit their command, in the
-     order the body issued them *)
-  List.iter (fun f -> f ()) (List.rev !pending_emits);
   (* answer queries and emit update responses from the handlers/outcomes the replay
      built, then drop any rejected update's event so the log stays consistent with
      what core replays after an eviction. *)
