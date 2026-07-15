@@ -33,9 +33,9 @@ type ('i, 'o) t = {
 
 let define ~name ~input ~output run = { name; input; output; run }
 
-(* An operation the workflow has started and can await: an activity, a timer, or a
-   child workflow, keyed by its per-type sequence number. *)
-type op = Op_activity of int | Op_timer of int | Op_child of int
+(* An operation the workflow has started and can await: an activity, a timer, a
+   child workflow, or a spawned fiber, keyed by its per-kind sequence number. *)
+type op = Op_activity of int | Op_timer of int | Op_child of int | Op_fiber of int
 
 (* What happens to a running child when the parent closes. *)
 type parent_close_policy = Terminate | Abandon | Request_cancel
@@ -65,6 +65,7 @@ type _ Effect.t +=
       -> op Effect.t
   | Await_effect : op -> Codec.payload Effect.t
   | Await_any_effect : op list -> (int * Codec.payload) Effect.t
+  | Spawn_effect : (unit -> unit) -> op Effect.t
 
 (* a handle to a not-yet-ready result: the pending operation plus how to decode it *)
 type 'a future = { op : op; decode : Codec.payload -> 'a }
@@ -82,6 +83,14 @@ let await_any (_ : _ ctx) (fs : 'a future list) : 'a =
     Effect.perform (Await_any_effect (List.map (fun f -> f.op) fs))
   in
   (List.nth fs idx).decode payload
+
+(* spawn a concurrent fiber running [f], scheduled cooperatively with the rest of the
+   workflow; returns a future for its result. The result value rides in [cell], which
+   the fiber sets on completion and the future's decode reads. *)
+let spawn (_ : _ ctx) (f : unit -> 'a) : 'a future =
+  let cell = ref None in
+  let op = Effect.perform (Spawn_effect (fun () -> cell := Some (f ()))) in
+  { op; decode = (fun _ -> match !cell with Some v -> v | None -> raise Not_found) }
 
 let start_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : _ ctx)
     (a : ('i, 'o) Activity.t) (input : 'i) : 'o future =

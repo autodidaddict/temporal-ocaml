@@ -200,6 +200,12 @@ module Workflow : sig
       losers keep running (Promise.race semantics); cancelling them awaits the
       cancellation-scope work. *)
 
+  val spawn : _ ctx -> (unit -> 'a) -> 'a future
+  (** [spawn ctx f] runs [f] as a concurrent fiber, scheduled cooperatively with the
+      rest of the workflow, and returns a future for its result. Use it for
+      independent concurrent control flow; to fan out operations, [start_*] plus
+      {!await_all} is simpler. *)
+
   val on_signal : _ ctx -> 'a Signal.t -> ('a -> unit) -> unit
   (** [on_signal ctx signal handler] runs [handler] whenever [signal] is
       received. The handler runs synchronously and typically mutates state the

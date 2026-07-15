@@ -225,26 +225,41 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
     | Some p -> p
     | None -> Codec.to_payload Codec.unit ()
   in
-  match_with
-    (fun () ->
-      wf.Workflow.body ~task_queue:default_tq ~workflow_id:state.wf_id ~run_id
-        ~can_suggested ~history_length arg)
-    ()
+  let dummy = Codec.to_payload Codec.unit () in
+  (* spawned fibers: each has a seq-keyed outcome and one waiter for whoever awaits
+     it. The result value itself rides in the future's own cell (Workflow.spawn); the
+     scheduler only tracks done-or-failed. *)
+  let fiber_seq = ref 0 in
+  let fiber_outcome : (int, (unit, exn) result) Hashtbl.t = Hashtbl.create 8 in
+  let fiber_waiters : (int, (unit, exn) result -> unit) Hashtbl.t = Hashtbl.create 8 in
+  let resolve_fiber id r =
+    Hashtbl.replace fiber_outcome id r;
+    match Hashtbl.find_opt fiber_waiters id with
+    | Some w -> Hashtbl.remove fiber_waiters id; Queue.push (fun () -> w r) ready
+    | None -> ()
+  in
+  let root_output = ref None in
+  (* the root fiber completing closes the workflow; any other fiber raising also fails
+     it. Catch exceptions in the body (try/with) to compensate and continue (saga). *)
+  let root_done = function
+    | Ok () ->
+      if not query_mode then
+        commands := [ Coresdk.Complete_workflow_execution !root_output ]
+    | Error exn ->
+      let msg = Printexc.to_string exn in
+      if query_mode then
+        Eio.traceln "[wf] workflow raised during query replay: %s" msg
+      else (
+        Eio.traceln "[wf] failing workflow execution: %s" msg;
+        commands := [ Coresdk.Fail_workflow_execution msg ])
+  in
+  (* run one fiber (the root body, or a spawned thunk) under the shared handler.
+     [on_done] gets Ok () on normal completion, Error on an uncaught raise. *)
+  let rec run_fiber (on_done : (unit, exn) result -> unit) (thunk : unit -> unit) =
+    match_with thunk ()
     {
-      retc =
-        (fun (output : Codec.payload) ->
-          if not query_mode then
-            commands := [ Coresdk.Complete_workflow_execution (Some output) ]);
-      exnc =
-        (fun exn ->
-          (* an uncaught exception in the workflow body fails the execution; catch it
-             in the body (try/with) to compensate and continue (saga) *)
-          let msg = Printexc.to_string exn in
-          if query_mode then
-            Eio.traceln "[wf] workflow raised during query replay: %s" msg
-          else (
-            Eio.traceln "[wf] failing workflow execution: %s" msg;
-            commands := [ Coresdk.Fail_workflow_execution msg ]));
+      retc = (fun () -> on_done (Ok ()));
+      exnc = (fun exn -> on_done (Error exn));
       effc =
         (fun (type a) (eff : a Effect.t) ->
           match eff with
@@ -328,7 +343,15 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                             Hashtbl.remove child_result_waiters s;
                             match r with
                             | R_ok p -> ok p
-                            | R_fail msg -> fail "child workflow failed: " msg)))
+                            | R_fail msg -> fail "child workflow failed: " msg))
+                | Workflow.Op_fiber id ->
+                  let wake = function
+                    | Ok () -> ok dummy
+                    | Error exn -> discontinue k exn
+                  in
+                  (match Hashtbl.find_opt fiber_outcome id with
+                   | Some r -> wake r
+                   | None -> Hashtbl.replace fiber_waiters id wake))
           | Workflow.Await_any_effect ops ->
             Some
               (fun (k : (a, unit) continuation) ->
@@ -363,8 +386,25 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                           | Child_run _run_id ->
                             Hashtbl.replace child_result_waiters s (fun r ->
                                 Hashtbl.remove child_result_waiters s;
-                                wake idx r)))
+                                wake idx r))
+                    | Workflow.Op_fiber id ->
+                      let wake_f = function
+                        | Ok () -> wake idx (R_ok dummy)
+                        | Error exn -> wake idx (R_fail (Printexc.to_string exn))
+                      in
+                      (match Hashtbl.find_opt fiber_outcome id with
+                       | Some r -> wake_f r
+                       | None -> Hashtbl.replace fiber_waiters id wake_f))
                   ops)
+          | Workflow.Spawn_effect thunk ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                incr fiber_seq;
+                let id = !fiber_seq in
+                (* the child runs when the ready queue next drains; the parent
+                   continues immediately *)
+                Queue.push (fun () -> run_fiber (resolve_fiber id) thunk) ready;
+                continue k (Workflow.Op_fiber id))
           | Workflow.Continue_as_new_effect new_arg ->
             Some
               (fun (_ : (a, unit) continuation) ->
@@ -396,7 +436,14 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                 if pred () then continue k ()
                 else cond_waiters := (pred, k) :: !cond_waiters)
           | _ -> None);
-    };
+    }
+  in
+  run_fiber root_done
+    (fun () ->
+      root_output :=
+        Some
+          (wf.Workflow.body ~task_queue:default_tq ~workflow_id:state.wf_id ~run_id
+             ~can_suggested ~history_length arg));
   run_ready ();
   (* drive the accumulated history log in order. A resolution wakes its waiter (via
      the ready queue, so resumes run FIFO); a signal or update delivers to its

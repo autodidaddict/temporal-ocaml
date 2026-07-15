@@ -441,6 +441,36 @@ let () =
      | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "B"
      | _ -> false)
 
+(* spawn: two independent fibers, each running an activity, awaited separately *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"SpawnW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let a = Workflow.spawn ctx (fun () -> Workflow.execute_activity ctx echo_act "A") in
+           let b = Workflow.spawn ctx (fun () -> Workflow.execute_activity ctx echo_act "B") in
+           let ra = Workflow.await ctx a in
+           let rb = Workflow.await ctx b in
+           ra ^ "+" ^ rb))
+  in
+  let run_id = "wf-spawn" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"SpawnW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "spawn: both fibers schedule their activities eagerly"
+    (match c1 with
+     | [ Coresdk.Schedule_activity { seq = 1; _ }; Coresdk.Schedule_activity { seq = 2; _ } ] ->
+       true
+     | _ -> false);
+  let ok s = Coresdk.Completed (Some (Codec.to_payload Codec.string s)) in
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 1; result = ok "A" });
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 2; result = ok "B" });
+  let c2 = activation wf st ~run_id ~history_length:3 in
+  check "spawn: completes with both fibers' results"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "A+B"
+     | _ -> false)
+
 let () =
   if !failures > 0 then (
     Printf.printf "%d replay test(s) failed\n" !failures;
