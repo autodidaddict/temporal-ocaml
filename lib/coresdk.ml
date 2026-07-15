@@ -26,6 +26,7 @@ type payload = Codec.payload
 type activity_resolution =
   | Completed of payload option (* ActivityResolution.completed = Success.result *)
   | Failed of string (* ActivityResolution.failed = Failure.message *)
+  | Cancelled of string (* ActivityResolution.cancelled = Cancellation.failure *)
   | Other_resolution
 
 (* Outcome of a child's first resolution (it was created, or could not be). *)
@@ -67,6 +68,7 @@ type wf_job =
       outcome : child_start_outcome;
     }
   | Resolve_child_workflow_execution of { seq : int; result : child_result }
+  | Cancel_workflow of { reason : string }
   | Remove_from_cache
   | Other
 
@@ -122,6 +124,17 @@ let decode_activity_resolution s =
         | _, w -> Pb.Reader.skip wrapper w
       done;
       res := Failed !msg
+    | 3, 2 ->
+      (* ActivityResolution.cancelled = Cancellation { failure=1 }, wrapping a
+         temporal...Failure (CanceledFailureInfo); take the deepest message. *)
+      let c = Pb.Reader.create (Pb.Reader.bytes r) in
+      let msg = ref "" in
+      while not (Pb.Reader.at_end c) do
+        match Pb.Reader.key c with
+        | 1, 2 -> msg := failure_message (Pb.Reader.bytes c)
+        | _, w -> Pb.Reader.skip c w
+      done;
+      res := Cancelled !msg
     | _, w -> Pb.Reader.skip r w
   done;
   !res
@@ -305,8 +318,19 @@ let decode_resolve_child s =
   done;
   Resolve_child_workflow_execution { seq = !seq; result = !result }
 
+(* CancelWorkflow { reason=1 (string); details omitted } *)
+let decode_cancel_workflow s =
+  let r = Pb.Reader.create s in
+  let reason = ref "" in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 2 -> reason := Pb.Reader.bytes r
+    | _, w -> Pb.Reader.skip r w
+  done;
+  Cancel_workflow { reason = !reason }
+
 (* WorkflowActivationJob { oneof { initialize_workflow=1; fire_timer=2;
-   query_workflow=5; signal_workflow=7; resolve_activity=8;
+   query_workflow=5; cancel_workflow=6; signal_workflow=7; resolve_activity=8;
    resolve_child_workflow_execution_start=10; resolve_child_workflow_execution=11;
    do_update=14; remove_from_cache=50 } } *)
 let decode_wf_job s =
@@ -317,6 +341,7 @@ let decode_wf_job s =
     | 1, 2 -> job := decode_initialize (Pb.Reader.bytes r)
     | 2, 2 -> job := decode_fire_timer (Pb.Reader.bytes r)
     | 5, 2 -> job := decode_query_workflow (Pb.Reader.bytes r)
+    | 6, 2 -> job := decode_cancel_workflow (Pb.Reader.bytes r)
     | 7, 2 -> job := decode_signal_workflow (Pb.Reader.bytes r)
     | 8, 2 -> job := decode_resolve_activity (Pb.Reader.bytes r)
     | 10, 2 -> job := decode_resolve_child_start (Pb.Reader.bytes r)
@@ -372,6 +397,7 @@ type wf_command =
       arguments : payload list;
       start_to_close : float; (* seconds *)
       max_attempts : int; (* 0 = unlimited (server default); 1 disables retries *)
+      cancellation_type : int; (* ActivityCancellationType: 0=TRY_CANCEL 1=WAIT_CANCELLATION_COMPLETED 2=ABANDON *)
     }
   | Start_timer of { seq : int; start_to_fire : float (* seconds *) }
   | Complete_workflow_execution of payload option
@@ -389,6 +415,13 @@ type wf_command =
       execution_timeout : float; (* seconds; 0. to omit *)
       run_timeout : float; (* seconds; 0. to omit *)
       parent_close_policy : int; (* ParentClosePolicy: 1=TERMINATE 2=ABANDON 3=REQUEST_CANCEL *)
+    }
+  | Request_cancel_activity of { seq : int } (* cancel a scheduled activity by its seq *)
+  | Cancel_timer of { seq : int } (* cancel a started timer by its seq *)
+  | Cancel_workflow_execution (* close this workflow as canceled *)
+  | Cancel_child_workflow_execution of {
+      child_workflow_seq : int; (* the StartChildWorkflowExecution seq *)
+      reason : string;
     }
 
 (* google.protobuf.Duration { int64 seconds=1; int32 nanos=2 } *)
@@ -444,6 +477,9 @@ let encode_command = function
     Pb.Writer.bytes sa 10 (encode_duration a.start_to_close);
     if a.max_attempts > 0 then
       Pb.Writer.bytes sa 12 (encode_retry_policy a.max_attempts);
+    (* omitted when TRY_CANCEL (0), which is core's default, keeping the common case
+       byte-identical to before the field existed *)
+    if a.cancellation_type <> 0 then Pb.Writer.int sa 13 a.cancellation_type;
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 2 (Pb.Writer.contents sa);
     (* WorkflowCommand.schedule_activity = 2 *)
@@ -522,6 +558,36 @@ let encode_command = function
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 11 (Pb.Writer.contents sc);
     (* WorkflowCommand.start_child_workflow_execution = 11 *)
+    Pb.Writer.contents cmd
+  | Request_cancel_activity { seq } ->
+    (* RequestCancelActivity { seq=1 } *)
+    let rca = Pb.Writer.create () in
+    Pb.Writer.int rca 1 seq;
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 4 (Pb.Writer.contents rca);
+    (* WorkflowCommand.request_cancel_activity = 4 *)
+    Pb.Writer.contents cmd
+  | Cancel_timer { seq } ->
+    (* CancelTimer { seq=1 } *)
+    let ct = Pb.Writer.create () in
+    Pb.Writer.int ct 1 seq;
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 5 (Pb.Writer.contents ct);
+    (* WorkflowCommand.cancel_timer = 5 *)
+    Pb.Writer.contents cmd
+  | Cancel_workflow_execution ->
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 9 "";
+    (* WorkflowCommand.cancel_workflow_execution = 9, empty message *)
+    Pb.Writer.contents cmd
+  | Cancel_child_workflow_execution { child_workflow_seq; reason } ->
+    (* CancelChildWorkflowExecution { child_workflow_seq=1; reason=2 } *)
+    let cc = Pb.Writer.create () in
+    Pb.Writer.int cc 1 child_workflow_seq;
+    if reason <> "" then Pb.Writer.bytes cc 2 reason;
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 12 (Pb.Writer.contents cc);
+    (* WorkflowCommand.cancel_child_workflow_execution = 12 *)
     Pb.Writer.contents cmd
 
 (* WorkflowActivationCompletion { run_id=1; successful=2 = Success{ commands=1 } } *)

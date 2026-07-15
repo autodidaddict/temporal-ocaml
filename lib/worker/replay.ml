@@ -270,6 +270,7 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                          arguments = [ arg ];
                          start_to_close;
                          max_attempts;
+                         cancellation_type = 0 (* TRY_CANCEL; real value arrives with activity cancel types *);
                        }))
           | Workflow.Start_timer_effect { start_to_fire } ->
             Some

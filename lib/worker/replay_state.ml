@@ -77,6 +77,7 @@ let apply_job (state : run_state) = function
       | Coresdk.Completed p ->
         R_ok (match p with Some x -> x | None -> Codec.to_payload Codec.unit ())
       | Coresdk.Failed msg -> R_fail msg
+      | Coresdk.Cancelled msg -> R_fail ("cancelled: " ^ msg)
       | Coresdk.Other_resolution -> R_fail "unknown activity resolution"
     in
     state.events_rev <- Activity_resolved (seq, r) :: state.events_rev
@@ -116,4 +117,4 @@ let apply_job (state : run_state) = function
     let p = match input with p :: _ -> p | [] -> Codec.to_payload Codec.unit () in
     state.events_rev <-
       Update { protocol_instance_id; name; input = p } :: state.events_rev
-  | Coresdk.Remove_from_cache | Coresdk.Other -> ()
+  | Coresdk.Cancel_workflow _ | Coresdk.Remove_from_cache | Coresdk.Other -> ()
