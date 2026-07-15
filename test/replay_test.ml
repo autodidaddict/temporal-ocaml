@@ -21,6 +21,9 @@ module Codec = Temporal__Codec
 module Coresdk = Temporal__Coresdk
 module Pb = Temporal__Pb
 module Activity = Temporal__Activity
+module Signal = Temporal__Signal
+module Query = Temporal__Query
+module Update = Temporal__Update
 module Workflow = Temporal__Workflow
 module Replay = Temporal__Replay
 module Replay_state = Temporal__Replay_state
@@ -187,6 +190,182 @@ let () =
     (match cmds2 with
      | [ Coresdk.Complete_workflow_execution (Some p) ] ->
        Codec.of_payload Codec.string p = "hi"
+     | _ -> false)
+
+let unit_arg = Codec.to_payload Codec.unit ()
+let approve = Signal.define ~name:"approve" Codec.unit
+let set_x = Signal.define ~name:"setx" Codec.int
+let status_q = Query.define ~name:"status" ~input:Codec.unit ~output:Codec.string
+let deposit = Update.define ~name:"deposit" ~input:Codec.int ~output:Codec.int
+
+(* timer: sleep starts a durable timer, FireTimer completes the run *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"TimerW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           Workflow.sleep ctx 5.;
+           "done"))
+  in
+  let run_id = "wf-timer" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"TimerW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "timer: starts timer on init"
+    (match c1 with
+     | [ Coresdk.Start_timer { seq = 1; start_to_fire } ] -> start_to_fire = 5.
+     | _ -> false);
+  Replay_state.apply_job st (Coresdk.Fire_timer { seq = 1 });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "timer: completes on fire"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "done"
+     | _ -> false)
+
+(* signal + wait_condition: block until a signal flips the condition *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"ApproveW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let decided = ref false in
+           Workflow.on_signal ctx approve (fun () -> decided := true);
+           Workflow.wait_condition ctx (fun () -> !decided);
+           "approved"))
+  in
+  let run_id = "wf-approve" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"ApproveW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "signal: blocks on wait_condition (no commands)" (c1 = []);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "approve"; input = [ unit_arg ] });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "signal: completes once the condition holds"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "approved"
+     | _ -> false)
+
+(* ADR-0002 history-ordered delivery: a signal sitting between two activity
+   resolutions is delivered at the second activity's checkpoint, so synchronous code
+   reading state between the two sees the pre-signal value. *)
+let () =
+  let act = Activity.define ~name:"a" ~input:Codec.unit ~output:Codec.string (fun () -> "a") in
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"OrderW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let x = ref 0 in
+           Workflow.on_signal ctx set_x (fun v -> x := v);
+           let _ = Workflow.execute_activity ctx act () in
+           let seen = !x in
+           let _ = Workflow.execute_activity ctx act () in
+           Printf.sprintf "seen=%d final=%d" seen !x))
+  in
+  let run_id = "wf-order" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"OrderW" ~workflow_id:run_id [ unit_arg ]);
+  let a_ok = Coresdk.Completed (Some (Codec.to_payload Codec.string "a")) in
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 1; result = a_ok });
+  Replay_state.apply_job st
+    (Coresdk.Signal_workflow { signal_name = "setx"; input = [ Codec.to_payload Codec.int 12 ] });
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 2; result = a_ok });
+  let c = activation wf st ~run_id ~history_length:4 in
+  check "signal ordering: delivered at the 2nd checkpoint, not before"
+    (match c with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "seen=0 final=12"
+     | _ -> false)
+
+(* query mode: a query-only activation replays read-only and answers via the handler *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"QueryW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let decided = ref None in
+           Workflow.on_signal ctx approve (fun () -> decided := Some "yes");
+           Workflow.on_query ctx status_q (fun () ->
+               match !decided with None -> "pending" | Some x -> x);
+           Workflow.wait_condition ctx (fun () -> !decided <> None);
+           Option.get !decided))
+  in
+  let run_id = "wf-query" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"QueryW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wf st ~run_id ~history_length:1 in
+  let c =
+    Replay.run_workflow wf st ~task_queue:"test-tq" ~run_id ~can_suggested:false
+      ~history_length:1 ~query_mode:true ~queries:[ ("q1", "status", []) ] ~updates:[]
+  in
+  check "query: answers pending with no advancing commands"
+    (match c with
+     | [ Coresdk.Respond_to_query { query_id = "q1"; result = Coresdk.Query_succeeded p } ] ->
+       Codec.of_payload Codec.string p = "pending"
+     | _ -> false)
+
+(* update: an accepted deposit returns the new balance; a validator rejects a
+   non-positive one, mutating nothing *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"AcctW" ~input:Codec.int ~output:Codec.int
+         (fun ctx opening ->
+           let bal = ref opening in
+           Workflow.on_update ctx deposit
+             ~validate:(fun a -> if a <= 0 then failwith "must be positive")
+             (fun a ->
+               bal := !bal + a;
+               !bal);
+           Workflow.wait_condition ctx (fun () -> false);
+           !bal))
+  in
+  let run_id = "wf-acct" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"AcctW" ~workflow_id:run_id [ Codec.to_payload Codec.int 100 ]);
+  let _ = activation wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st
+    (Coresdk.Do_update
+       { protocol_instance_id = "u1"; name = "deposit"; input = [ Codec.to_payload Codec.int 50 ];
+         run_validator = true });
+  let c1 =
+    Replay.run_workflow wf st ~task_queue:"test-tq" ~run_id ~can_suggested:false
+      ~history_length:2 ~query_mode:false ~queries:[] ~updates:[ ("u1", true) ]
+  in
+  check "update: accepted then completed with new balance"
+    (match c1 with
+     | [ Coresdk.Update_response { protocol_instance_id = "u1"; outcome = Coresdk.Update_accepted };
+         Coresdk.Update_response { protocol_instance_id = "u1"; outcome = Coresdk.Update_completed p } ]
+       -> Codec.of_payload Codec.int p = 150
+     | _ -> false);
+  Replay_state.apply_job st
+    (Coresdk.Do_update
+       { protocol_instance_id = "u2"; name = "deposit"; input = [ Codec.to_payload Codec.int (-5) ];
+         run_validator = true });
+  let c2 =
+    Replay.run_workflow wf st ~task_queue:"test-tq" ~run_id ~can_suggested:false
+      ~history_length:3 ~query_mode:false ~queries:[] ~updates:[ ("u2", true) ]
+  in
+  check "update: validator rejects a non-positive deposit"
+    (match c2 with
+     | [ Coresdk.Update_response { protocol_instance_id = "u2"; outcome = Coresdk.Update_rejected _ } ]
+       -> true
+     | _ -> false)
+
+(* continue-as-new: a positive counter starts a fresh run with the decremented arg *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"CanW" ~input:Codec.int ~output:Codec.string
+         (fun ctx n -> if n > 0 then Workflow.continue_as_new ctx (n - 1) else "done"))
+  in
+  let run_id = "wf-can" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"CanW" ~workflow_id:run_id [ Codec.to_payload Codec.int 1 ]);
+  let c = activation wf st ~run_id ~history_length:1 in
+  check "continue-as-new: emits Continue_as_new with the decremented arg"
+    (match c with
+     | [ Coresdk.Continue_as_new { arguments = [ p ] } ] -> Codec.of_payload Codec.int p = 0
      | _ -> false)
 
 let () =

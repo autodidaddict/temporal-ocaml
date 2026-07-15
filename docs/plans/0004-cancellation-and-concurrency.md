@@ -113,8 +113,13 @@ Behavior-preserving refactor.
 Each is resolved by the phase noted:
 
 - Within-activation scheduling order (Phase 1).
-- Emit-once for a single outstanding operation (Phase 0 spike, Phase 2).
-- Timer cancel resolution (Phase 0 spike, Phase 6).
+- Emit-once for a single outstanding operation (Phase 0 spike, Phase 2). Spike result:
+  the current engine does re-emit `Start_timer` for an outstanding timer on a
+  signal-triggered re-run, and sdk-core tolerates it (livetest scenario 7 completes).
+  Emit-once is therefore a cleanliness and safety measure for concurrency, not a fix
+  for a live break today.
+- Timer cancel resolution (Phase 6). Deferred from the Phase 0 spike: we cannot emit
+  `CancelTimer` until Phase 5, so the confirmation moves to Phase 6.
 - `Canceled` and the failure taxonomy (Phase 4 onward).
 - `await_any` and losers (Phase 2).
 - Scope identity across replay (Phase 4).
