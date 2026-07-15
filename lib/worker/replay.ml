@@ -26,6 +26,17 @@
 
 open Replay_state
 
+(* how an outstanding operation reacts when its scope is cancelled: the cancel command
+   to send, whether to send it (Abandon does not), and whether to raise Canceled in the
+   awaiter at once. When [raise_on_cancel] is false (Wait_cancellation_completed
+   activity, or a child with wait_for_cancellation), the awaiter stays parked for the
+   server's resolution instead. *)
+type cancel_spec = {
+  cmd : Coresdk.wf_command;
+  emit_on_cancel : bool;
+  raise_on_cancel : bool;
+}
+
 (* [queries] are the (query_id, query_type, arguments) of any QueryWorkflow jobs, and
    [updates] the (protocol_instance_id, run_validator) of any DoUpdate jobs, on this
    activation (whose Update events apply_job already appended to the log, in job
@@ -234,31 +245,35 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
     | None -> false
   in
   (* every started activity/timer/child is cancellable until it resolves. [op_scope]
-     records the scope it ran under, [cancel_cmd] the command to cancel it, and
-     [cancel_hook] (present once the op is awaited) discontinues the parked fiber with
-     Canceled. Keys are "act:seq" / "timer:seq" / "child:seq". *)
+     records the scope it ran under and [op_cancel] its [cancel_spec] (what to emit and
+     whether to raise at once). [cancel_hook], present once a raise-on-cancel op is
+     awaited, discontinues the parked fiber with Canceled. Keys are "act:seq" /
+     "timer:seq" / "child:seq". *)
   let op_scope : (string, int) Hashtbl.t = Hashtbl.create 8 in
-  let cancel_cmd : (string, Coresdk.wf_command) Hashtbl.t = Hashtbl.create 8 in
+  let op_cancel : (string, cancel_spec) Hashtbl.t = Hashtbl.create 8 in
   let cancel_hook : (string, unit -> unit) Hashtbl.t = Hashtbl.create 8 in
-  let track_op key scope cmd =
+  let track_op key scope ~cmd ~emit ~raise_now =
     Hashtbl.replace op_scope key scope;
-    Hashtbl.replace cancel_cmd key cmd
+    Hashtbl.replace op_cancel key
+      { cmd; emit_on_cancel = emit; raise_on_cancel = raise_now }
   in
   let untrack_op key =
-    Hashtbl.remove cancel_cmd key;
+    Hashtbl.remove op_cancel key;
     Hashtbl.remove cancel_hook key
   in
   let do_cancel sc =
     Hashtbl.replace cancelled_scopes sc ();
-    (* copy: cancel_cmd/cancel_hook are removed while iterating *)
+    (* copy: cancel_hook entries are removed while iterating *)
     Hashtbl.iter
-      (fun key cmd ->
+      (fun key spec ->
         if is_cancelled (Hashtbl.find op_scope key) then (
-          emit_once ("cancel-" ^ key) cmd;
-          (match Hashtbl.find_opt cancel_hook key with Some h -> h () | None -> ());
-          Hashtbl.remove cancel_cmd key;
-          Hashtbl.remove cancel_hook key))
-      (Hashtbl.copy cancel_cmd)
+          if spec.emit_on_cancel then emit_once ("cancel-" ^ key) spec.cmd;
+          (* raise now, or leave the awaiter parked for the server's resolution *)
+          if spec.raise_on_cancel then
+            match Hashtbl.find_opt cancel_hook key with
+            | Some h -> Hashtbl.remove cancel_hook key; h ()
+            | None -> ()))
+      (Hashtbl.copy op_cancel)
   in
   let arg =
     match state.init_arg with
@@ -311,7 +326,7 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
         (fun (type a) (eff : a Effect.t) ->
           match eff with
           | Workflow.Start_activity_effect
-              { scope; activity_type; arg; start_to_close; max_attempts } ->
+              { scope; activity_type; arg; start_to_close; max_attempts; cancel_type } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr act_seq;
@@ -327,9 +342,13 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                        arguments = [ arg ];
                        start_to_close;
                        max_attempts;
-                       cancellation_type = 0 (* TRY_CANCEL; real value arrives with activity cancel types *);
+                       cancellation_type = cancel_type;
                      });
-                track_op key scope (Coresdk.Request_cancel_activity { seq = s });
+                (* Abandon (2) sends no cancel command; Wait_cancellation_completed (1)
+                   sends it but waits for the resolution rather than raising at once. *)
+                track_op key scope
+                  ~cmd:(Coresdk.Request_cancel_activity { seq = s })
+                  ~emit:(cancel_type <> 2) ~raise_now:(cancel_type <> 1);
                 continue k (Workflow.Op_activity s))
           | Workflow.Start_timer_effect { scope; start_to_fire } ->
             Some
@@ -338,11 +357,13 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                 let s = !timer_seq in
                 let key = Printf.sprintf "timer:%d" s in
                 emit_once key (Coresdk.Start_timer { seq = s; start_to_fire });
-                track_op key scope (Coresdk.Cancel_timer { seq = s });
+                track_op key scope ~cmd:(Coresdk.Cancel_timer { seq = s })
+                  ~emit:true ~raise_now:true;
                 continue k (Workflow.Op_timer s))
           | Workflow.Start_child_effect
               { scope; workflow_id; workflow_type; input; task_queue;
-                parent_close_policy; execution_timeout; run_timeout } ->
+                parent_close_policy; execution_timeout; run_timeout;
+                wait_for_cancellation } ->
             Some
               (fun (k : (a, unit) continuation) ->
                 incr child_seq;
@@ -367,9 +388,13 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                        run_timeout;
                        parent_close_policy;
                      });
+                (* wait_for_cancellation sends the cancel but waits for the child's own
+                   resolution instead of raising Canceled at once *)
                 track_op key scope
-                  (Coresdk.Cancel_child_workflow_execution
-                     { child_workflow_seq = s; reason = "" });
+                  ~cmd:
+                    (Coresdk.Cancel_child_workflow_execution
+                       { child_workflow_seq = s; reason = "" })
+                  ~emit:true ~raise_now:(not wait_for_cancellation);
                 continue k (Workflow.Op_child s))
           | Workflow.Await_effect op ->
             Some
@@ -379,18 +404,29 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                    raises Canceled if its scope is already cancelled, or later if a
                    cancel reaches it while parked. A child awaits in two stages. *)
                 let ok p = continue k p
-                and fail label msg = discontinue k (Failure (label ^ msg)) in
+                and fail label msg = discontinue k (Failure (label ^ msg))
+                and canceled msg = discontinue k (Workflow.Canceled msg) in
                 let park_cancellable key ~remove_waiter ~register_waiter =
-                  if is_cancelled (Hashtbl.find op_scope key) then
+                  (* a raise-on-cancel op raises Canceled at once if its scope is already
+                     cancelled, and installs a hook so a later cancel reaches it while
+                     parked. A wait-on-cancel op always parks and lets the server's
+                     resolution wake it. *)
+                  let raise_on_cancel =
+                    match Hashtbl.find_opt op_cancel key with
+                    | Some s -> s.raise_on_cancel
+                    | None -> true
+                  in
+                  if raise_on_cancel && is_cancelled (Hashtbl.find op_scope key) then
                     discontinue k (Workflow.Canceled "scope canceled")
                   else (
                     register_waiter ();
-                    Hashtbl.replace cancel_hook key (fun () ->
-                        remove_waiter ();
-                        Queue.push
-                          (fun () ->
-                            discontinue k (Workflow.Canceled "scope canceled"))
-                          ready))
+                    if raise_on_cancel then
+                      Hashtbl.replace cancel_hook key (fun () ->
+                          remove_waiter ();
+                          Queue.push
+                            (fun () ->
+                              discontinue k (Workflow.Canceled "scope canceled"))
+                            ready))
                 in
                 match op with
                 | Workflow.Op_activity s ->
@@ -403,6 +439,7 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                           untrack_op key;
                           match r with
                           | R_ok p -> ok p
+                          | R_cancelled msg -> canceled msg
                           | R_fail msg -> fail "activity failed: " msg))
                 | Workflow.Op_timer s ->
                   let key = Printf.sprintf "timer:%d" s in
@@ -432,6 +469,7 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                                 untrack_op key;
                                 match r with
                                 | R_ok p -> ok p
+                                | R_cancelled msg -> canceled msg
                                 | R_fail msg -> fail "child workflow failed: " msg)))
                 | Workflow.Op_fiber id ->
                   let wake = function
@@ -452,6 +490,7 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                     resolved := true;
                     match r with
                     | R_ok p -> continue k (idx, p)
+                    | R_cancelled msg -> discontinue k (Workflow.Canceled msg)
                     | R_fail msg ->
                       discontinue k (Failure ("awaited operation failed: " ^ msg)))
                 in

@@ -735,6 +735,230 @@ let () =
        Codec.of_payload Codec.string p = "met=false"
      | _ -> false)
 
+(* Phase 6: per-operation cancellation. Activity cancel types, timer local cancel,
+   distinct Canceled on a server-cancelled resolution, and child wait_for_cancellation. *)
+
+(* Abandon: the scheduled command carries cancellation_type=2, and cancelling the scope
+   emits no cancel command (unlike Try_cancel). *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"AbandonW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let go = ref false and released = ref false in
+           Workflow.on_signal ctx go_sig (fun () -> go := true);
+           Workflow.on_signal ctx release_sig (fun () -> released := true);
+           Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+               let _a =
+                 Workflow.start_activity ~cancel_type:Workflow.Abandon ctx' echo_act "A"
+               in
+               Workflow.wait_condition ctx (fun () -> !go);
+               cancel ();
+               Workflow.wait_condition ctx (fun () -> !released);
+               "done")))
+  in
+  let run_id = "wf-abandon" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"AbandonW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "abandon: schedules with cancellation_type=2 (ABANDON)"
+    (match c1 with
+     | [ Coresdk.Schedule_activity { seq = 1; cancellation_type = 2; _ } ] -> true
+     | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "go"; input = [ unit_arg ] });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "abandon: canceling the scope emits no cancel command" (c2 = [])
+
+(* Wait_cancellation_completed: cancelling requests activity cancellation but does not
+   raise at once; the awaiter waits for the server's resolution. A Cancelled resolution
+   then raises Canceled; a Completed one returns the real result. *)
+let wcc_wf =
+  Workflow.reg
+    (Workflow.define ~name:"WccW" ~input:Codec.unit ~output:Codec.string
+       (fun ctx () ->
+         Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+             let a =
+               Workflow.start_activity ~cancel_type:Workflow.Wait_cancellation_completed
+                 ctx' echo_act "A"
+             in
+             cancel ();
+             try Workflow.await ctx' a with Workflow.Canceled _ -> "cancelled")))
+
+let () =
+  let run_id = "wf-wcc-cancelled" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"WccW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wcc_wf st ~run_id ~history_length:1 in
+  check "wait-cancellation-completed: requests cancellation but keeps waiting"
+    (match c1 with
+     | [ Coresdk.Schedule_activity { seq = 1; cancellation_type = 1; _ };
+         Coresdk.Request_cancel_activity { seq = 1 } ] ->
+       true
+     | _ -> false);
+  Replay_state.apply_job st
+    (Coresdk.Resolve_activity { seq = 1; result = Coresdk.Cancelled "stopped" });
+  let c2 = activation wcc_wf st ~run_id ~history_length:2 in
+  check "wait-cancellation-completed: a Cancelled resolution raises Canceled"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "cancelled"
+     | _ -> false)
+
+let () =
+  let run_id = "wf-wcc-ignored" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"WccW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wcc_wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st
+    (Coresdk.Resolve_activity
+       { seq = 1; result = Coresdk.Completed (Some (Codec.to_payload Codec.string "A")) });
+  let c2 = activation wcc_wf st ~run_id ~history_length:2 in
+  check "wait-cancellation-completed: an ignored cancel returns the real result"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "A"
+     | _ -> false)
+
+(* timer local cancel: cancelling a scope with an awaited timer emits CancelTimer and
+   raises Canceled in the body awaiting it. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"TimerCancelW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let go = ref false and released = ref false in
+           Workflow.on_signal ctx go_sig (fun () -> go := true);
+           Workflow.on_signal ctx release_sig (fun () -> released := true);
+           let outcome =
+             Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+                 let _ =
+                   Workflow.spawn ctx (fun () ->
+                       Workflow.wait_condition ctx (fun () -> !go);
+                       cancel ())
+                 in
+                 try
+                   Workflow.sleep ctx' 60.;
+                   "slept"
+                 with Workflow.Canceled _ -> "timer-cancelled")
+           in
+           Workflow.wait_condition ctx (fun () -> !released);
+           outcome))
+  in
+  let run_id = "wf-timer-cancel" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"TimerCancelW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "timer cancel: starts the timer"
+    (match c1 with [ Coresdk.Start_timer { seq = 1; _ } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "go"; input = [ unit_arg ] });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "timer cancel: canceling the scope cancels the timer"
+    (match c2 with [ Coresdk.Cancel_timer { seq = 1 } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Signal_workflow { signal_name = "release"; input = [ unit_arg ] });
+  let c3 = activation wf st ~run_id ~history_length:3 in
+  check "timer cancel: the body observes Canceled from the cancelled timer"
+    (match c3 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "timer-cancelled"
+     | _ -> false)
+
+(* server-cancelled activity: a ResolveActivity carrying Cancelled raises Canceled at
+   the await, distinct from a generic failure. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"ActCancelledW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           try
+             let _ = Workflow.execute_activity ctx echo_act "A" in
+             "completed"
+           with
+           | Workflow.Canceled _ -> "canceled"
+           | Failure _ -> "failed"))
+  in
+  let run_id = "wf-act-cancelled" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"ActCancelledW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st
+    (Coresdk.Resolve_activity { seq = 1; result = Coresdk.Cancelled "server stopped it" });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "server-cancelled activity: raises Canceled, not a generic failure"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "canceled"
+     | _ -> false)
+
+let child_wf =
+  Workflow.define ~name:"ChildW" ~input:Codec.string ~output:Codec.string (fun _ s -> s)
+
+(* server-cancelled child: a ResolveChildWorkflowExecution carrying Cancelled raises a
+   distinct Canceled at the await. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"ChildCancelledW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           try
+             let _ = Workflow.execute_child_workflow ctx child_wf "x" in
+             "completed"
+           with
+           | Workflow.Canceled _ -> "canceled"
+           | Failure _ -> "failed"))
+  in
+  let run_id = "wf-child-cancelled" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"ChildCancelledW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st
+    (Coresdk.Resolve_child_workflow_execution_start
+       { seq = 1; outcome = Coresdk.Child_start_succeeded "run-x" });
+  Replay_state.apply_job st
+    (Coresdk.Resolve_child_workflow_execution { seq = 1; result = Coresdk.Child_cancelled "stopped" });
+  let c2 = activation wf st ~run_id ~history_length:3 in
+  check "server-cancelled child: raises Canceled, not a generic failure"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "canceled"
+     | _ -> false)
+
+(* child wait_for_cancellation: cancelling requests the child's cancellation but does
+   not raise until the child actually resolves. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"ChildWaitCancelW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+               let c =
+                 Workflow.start_child_workflow ~wait_for_cancellation:true ctx' child_wf "x"
+               in
+               cancel ();
+               try
+                 let _ = Workflow.await ctx' c in
+                 "completed"
+               with Workflow.Canceled _ -> "child-cancelled")))
+  in
+  let run_id = "wf-child-wait-cancel" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"ChildWaitCancelW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "child wait_for_cancellation: requests cancellation but keeps waiting"
+    (match c1 with
+     | [ Coresdk.Start_child_workflow_execution { seq = 1; _ };
+         Coresdk.Cancel_child_workflow_execution { child_workflow_seq = 1; _ } ] ->
+       true
+     | _ -> false);
+  Replay_state.apply_job st
+    (Coresdk.Resolve_child_workflow_execution_start
+       { seq = 1; outcome = Coresdk.Child_start_succeeded "run-x" });
+  Replay_state.apply_job st
+    (Coresdk.Resolve_child_workflow_execution { seq = 1; result = Coresdk.Child_cancelled "stopped" });
+  let c2 = activation wf st ~run_id ~history_length:3 in
+  check "child wait_for_cancellation: raises Canceled once the child resolves"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "child-cancelled"
+     | _ -> false)
+
 let () =
   if !failures > 0 then (
     Printf.printf "%d replay test(s) failed\n" !failures;

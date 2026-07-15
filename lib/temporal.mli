@@ -116,9 +116,18 @@ module Workflow : sig
     ('input, 'output) t
   (** [define ~name ~input ~output f] declares a workflow called [name]. *)
 
+  type activity_cancel_type =
+    | Try_cancel  (** request cancellation and raise {!Canceled} at once (default) *)
+    | Wait_cancellation_completed
+        (** request cancellation, then raise {!Canceled} only once the activity's own
+            resolution arrives. This needs activity heartbeating, which does not exist
+            yet, so today it mostly affects an activity that has not started. *)
+    | Abandon  (** raise {!Canceled} at once and send no cancellation request *)
+
   val execute_activity :
     ?start_to_close:float ->
     ?max_attempts:int ->
+    ?cancel_type:activity_cancel_type ->
     _ ctx ->
     ('i, 'o) Activity.t ->
     'i ->
@@ -128,7 +137,8 @@ module Workflow : sig
       seconds (default 10). [max_attempts] caps retries: 1 disables retries, 0
       (the default) leaves it unlimited (bounded by the timeouts). An activity
       that exhausts its attempts resolves as a failure, which raises in the
-      workflow body at the call site. *)
+      workflow body at the call site. [cancel_type] selects how a cancel of the
+      enclosing scope reaches the activity (default {!Try_cancel}). *)
 
   type parent_close_policy =
     | Terminate  (** terminate the child when the parent closes (default) *)
@@ -141,6 +151,7 @@ module Workflow : sig
     ?parent_close_policy:parent_close_policy ->
     ?execution_timeout:float ->
     ?run_timeout:float ->
+    ?wait_for_cancellation:bool ->
     _ ctx ->
     ('i, 'o) t ->
     'i ->
@@ -149,8 +160,11 @@ module Workflow : sig
       own workflow definition) as a child workflow, waits for it, and returns its
       result. [workflow_id] defaults to a deterministic id derived from the
       parent's id; [task_queue] defaults to the parent's; [parent_close_policy]
-      defaults to [Terminate]. A child that fails or is cancelled raises at the
-      call site, like a failed activity. *)
+      defaults to [Terminate]. A child that fails raises at the call site like a
+      failed activity, and a cancelled child raises {!Canceled}. If
+      [wait_for_cancellation] is set, cancelling the enclosing scope requests the
+      child's cancellation and then waits for the child to actually end before
+      raising, rather than raising at once (default [false]). *)
 
   val sleep : _ ctx -> float -> unit
   (** [sleep ctx seconds] durably suspends the workflow for [seconds] via a
@@ -160,6 +174,7 @@ module Workflow : sig
   val start_activity :
     ?start_to_close:float ->
     ?max_attempts:int ->
+    ?cancel_type:activity_cancel_type ->
     _ ctx ->
     ('i, 'o) Activity.t ->
     'i ->
@@ -178,6 +193,7 @@ module Workflow : sig
     ?parent_close_policy:parent_close_policy ->
     ?execution_timeout:float ->
     ?run_timeout:float ->
+    ?wait_for_cancellation:bool ->
     _ ctx ->
     ('i, 'o) t ->
     'i ->

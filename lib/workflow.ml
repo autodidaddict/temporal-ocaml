@@ -41,6 +41,20 @@ type op = Op_activity of int | Op_timer of int | Op_child of int | Op_fiber of i
 (* What happens to a running child when the parent closes. *)
 type parent_close_policy = Terminate | Abandon | Request_cancel
 
+(* How an activity reacts when its enclosing scope is cancelled. Try_cancel (the
+   default, matching sdk-core and the Go/Java/Python default) requests cancellation and
+   resolves the await with Canceled at once. Wait_cancellation_completed requests it and
+   waits for the activity's own resolution (needs heartbeating, not yet implemented, so
+   today it mostly affects an activity that has not started). Abandon resolves with
+   Canceled at once and sends no cancel request. *)
+type activity_cancel_type = Try_cancel | Wait_cancellation_completed | Abandon
+
+(* sdk-core ActivityCancellationType: 0=TRY_CANCEL 1=WAIT_CANCELLATION_COMPLETED 2=ABANDON *)
+let int_of_cancel_type = function
+  | Try_cancel -> 0
+  | Wait_cancellation_completed -> 1
+  | Abandon -> 2
+
 (* Raised at an await point inside a cancelled scope, and by an await whose operation
    is already cancelled. An ordinary exception: catch it to compensate, then re-raise
    to propagate the cancel or return normally to deny it. *)
@@ -58,6 +72,7 @@ type _ Effect.t +=
       arg : Codec.payload;
       start_to_close : float;
       max_attempts : int;
+      cancel_type : int; (* ActivityCancellationType, see int_of_cancel_type *)
     }
       -> op Effect.t
   | Start_timer_effect : { scope : int; start_to_fire : float } -> op Effect.t
@@ -70,6 +85,7 @@ type _ Effect.t +=
       parent_close_policy : int; (* 1=TERMINATE 2=ABANDON 3=REQUEST_CANCEL *)
       execution_timeout : float;
       run_timeout : float;
+      wait_for_cancellation : bool; (* on cancel, wait for the child's resolution *)
     }
       -> op Effect.t
   | Await_effect : op -> Codec.payload Effect.t
@@ -105,21 +121,22 @@ let spawn (_ : _ ctx) (f : unit -> 'a) : 'a future =
   let op = Effect.perform (Spawn_effect (fun () -> cell := Some (f ()))) in
   { op; decode = (fun _ -> match !cell with Some v -> v | None -> raise Not_found) }
 
-let start_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (ctx : _ ctx)
-    (a : ('i, 'o) Activity.t) (input : 'i) : 'o future =
+let start_activity ?(start_to_close = 10.0) ?(max_attempts = 0)
+    ?(cancel_type = Try_cancel) (ctx : _ ctx) (a : ('i, 'o) Activity.t) (input : 'i) :
+    'o future =
   let arg = Codec.to_payload a.Activity.input input in
   let op =
     Effect.perform
       (Start_activity_effect
          { scope = ctx.scope; activity_type = a.Activity.name; arg; start_to_close;
-           max_attempts })
+           max_attempts; cancel_type = int_of_cancel_type cancel_type })
   in
   { op; decode = Codec.of_payload a.Activity.output }
 
 (* execute_activity is start-and-await: schedule [activity], wait for it, and return
    the result (raising at the call site if it failed) *)
-let execute_activity ?start_to_close ?max_attempts ctx a input =
-  await ctx (start_activity ?start_to_close ?max_attempts ctx a input)
+let execute_activity ?start_to_close ?max_attempts ?cancel_type ctx a input =
+  await ctx (start_activity ?start_to_close ?max_attempts ?cancel_type ctx a input)
 
 let start_timer (ctx : _ ctx) (seconds : float) : unit future =
   let op =
@@ -131,8 +148,8 @@ let start_timer (ctx : _ ctx) (seconds : float) : unit future =
 let sleep ctx (seconds : float) : unit = await ctx (start_timer ctx seconds)
 
 let start_child_workflow ?workflow_id ?task_queue ?(parent_close_policy = Terminate)
-    ?(execution_timeout = 0.) ?(run_timeout = 0.) (ctx : _ ctx) (w : ('i, 'o) t)
-    (input : 'i) : 'o future =
+    ?(execution_timeout = 0.) ?(run_timeout = 0.) ?(wait_for_cancellation = false)
+    (ctx : _ ctx) (w : ('i, 'o) t) (input : 'i) : 'o future =
   let policy =
     match parent_close_policy with
     | Terminate -> 1
@@ -151,16 +168,17 @@ let start_child_workflow ?workflow_id ?task_queue ?(parent_close_policy = Termin
            parent_close_policy = policy;
            execution_timeout;
            run_timeout;
+           wait_for_cancellation;
          })
   in
   { op; decode = Codec.of_payload w.output }
 
 (* execute_child_workflow is start-and-await: start the child and wait for it *)
 let execute_child_workflow ?workflow_id ?task_queue ?parent_close_policy
-    ?execution_timeout ?run_timeout ctx w input =
+    ?execution_timeout ?run_timeout ?wait_for_cancellation ctx w input =
   await ctx
     (start_child_workflow ?workflow_id ?task_queue ?parent_close_policy
-       ?execution_timeout ?run_timeout ctx w input)
+       ?execution_timeout ?run_timeout ?wait_for_cancellation ctx w input)
 
 (* run [f] in a fresh cancellable child scope. [cancel ()] cancels every operation
    started under the child ctx, raising Canceled in fibers awaiting them. *)
