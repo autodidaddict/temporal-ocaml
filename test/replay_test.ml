@@ -959,6 +959,95 @@ let () =
        Codec.of_payload Codec.string p = "child-cancelled"
      | _ -> false)
 
+(* Phase 7: workflow-level cancellation. A CancelWorkflow job is delivered as an
+   order-sensitive history event that cancels the root scope. *)
+
+(* cancel while blocked on an activity: the body does not catch Canceled, so it escapes
+   the main body and the workflow closes as CancelWorkflowExecution. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"CancelBlockedW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () -> Workflow.execute_activity ctx echo_act "A"))
+  in
+  let run_id = "wf-cancel-blocked" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"CancelBlockedW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "workflow cancel: schedules the activity"
+    (match c1 with [ Coresdk.Schedule_activity { seq = 1; _ } ] -> true | _ -> false);
+  Replay_state.apply_job st (Coresdk.Cancel_workflow { reason = "" });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "workflow cancel: uncaught Canceled closes as CancelWorkflowExecution"
+    (match c2 with [ Coresdk.Cancel_workflow_execution ] -> true | _ -> false)
+
+(* cancel while blocked on an activity, caught: the body may catch Canceled and
+   complete normally, denying the cancel. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"CancelDenyW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           try Workflow.execute_activity ctx echo_act "A"
+           with Workflow.Canceled _ -> "denied"))
+  in
+  let run_id = "wf-cancel-deny" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"CancelDenyW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st (Coresdk.Cancel_workflow { reason = "" });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "workflow cancel: the body may catch Canceled and complete normally"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "denied"
+     | _ -> false)
+
+(* cancel while blocked on a wait_condition: the wait is interrupted with Canceled
+   rather than hanging (the signal that would release it is never coming). *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"CancelWaitCondW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let approved = ref false in
+           Workflow.on_signal ctx approve (fun () -> approved := true);
+           Workflow.wait_condition ctx (fun () -> !approved);
+           "approved"))
+  in
+  let run_id = "wf-cancel-waitcond" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"CancelWaitCondW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "workflow cancel: blocks on wait_condition (no commands)" (c1 = []);
+  Replay_state.apply_job st (Coresdk.Cancel_workflow { reason = "" });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "workflow cancel: interrupts a wait_condition rather than hanging"
+    (match c2 with [ Coresdk.Cancel_workflow_execution ] -> true | _ -> false)
+
+(* order-sensitivity: a cancel ordered before an activity resolution preempts it, so
+   the (caught) Canceled wins and the resolution is ignored. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"CancelOrderW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           try Workflow.execute_activity ctx echo_act "A"
+           with Workflow.Canceled _ -> "canceled"))
+  in
+  let run_id = "wf-cancel-order" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"CancelOrderW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st (Coresdk.Cancel_workflow { reason = "" });
+  Replay_state.apply_job st
+    (Coresdk.Resolve_activity
+       { seq = 1; result = Coresdk.Completed (Some (Codec.to_payload Codec.string "A")) });
+  let c2 = activation wf st ~run_id ~history_length:3 in
+  check "workflow cancel: a cancel ordered before a resolution preempts it"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "canceled"
+     | _ -> false)
+
 let () =
   if !failures > 0 then (
     Printf.printf "%d replay test(s) failed\n" !failures;

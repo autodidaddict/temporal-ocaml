@@ -45,6 +45,10 @@ type event =
        reject decision and the response are per-activation, not stored here. *)
   | Child_started of int * child_start (* seq, start outcome *)
   | Child_resolved of int * resolution (* seq, completion outcome *)
+  | Cancel_root of string
+    (* a CancelWorkflow job: cancel the root scope at this point in history. Ordered
+       like a signal, since where the body is parked when it arrives decides where
+       Canceled is raised. *)
 
 type run_state = {
   mutable wf_name : string;
@@ -127,4 +131,6 @@ let apply_job (state : run_state) = function
     let p = match input with p :: _ -> p | [] -> Codec.to_payload Codec.unit () in
     state.events_rev <-
       Update { protocol_instance_id; name; input = p } :: state.events_rev
-  | Coresdk.Cancel_workflow _ | Coresdk.Remove_from_cache | Coresdk.Other -> ()
+  | Coresdk.Cancel_workflow { reason } ->
+    state.events_rev <- Cancel_root reason :: state.events_rev
+  | Coresdk.Remove_from_cache | Coresdk.Other -> ()

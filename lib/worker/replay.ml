@@ -220,16 +220,19 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
   let timer_waiters : (int, unit -> unit) Hashtbl.t = Hashtbl.create 8 in
   let child_start_waiters : (int, child_start -> unit) Hashtbl.t = Hashtbl.create 8 in
   let child_result_waiters : (int, resolution -> unit) Hashtbl.t = Hashtbl.create 8 in
-  (* fibers blocked on a predicate, re-checked after each event *)
-  let cond_waiters : ((unit -> bool) * (unit, unit) continuation) list ref = ref [] in
+  (* fibers blocked on a predicate, re-checked after each event; tagged with the scope
+     they wait under so a cancel can interrupt them *)
+  let cond_waiters : (int * (unit -> bool) * (unit, unit) continuation) list ref =
+    ref []
+  in
   (* runnable resumes, drained FIFO so command-issue order is deterministic *)
   let ready : (unit -> unit) Queue.t = Queue.create () in
   let run_ready () = while not (Queue.is_empty ready) do (Queue.pop ready) () done in
   (* after each event, wake any fiber whose predicate now holds *)
   let wake_conditions () =
-    let woken, still = List.partition (fun (p, _) -> p ()) !cond_waiters in
+    let woken, still = List.partition (fun (_, p, _) -> p ()) !cond_waiters in
     cond_waiters := still;
-    List.iter (fun (_, k) -> Queue.push (fun () -> continue k ()) ready) woken
+    List.iter (fun (_, _, k) -> Queue.push (fun () -> continue k ()) ready) woken
   in
   (* ---- cancellation scopes --------------------------------------------- *)
   (* scope 0 is the root. A non-detached child inherits its parent's cancellation; a
@@ -273,7 +276,16 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
             match Hashtbl.find_opt cancel_hook key with
             | Some h -> Hashtbl.remove cancel_hook key; h ()
             | None -> ()))
-      (Hashtbl.copy op_cancel)
+      (Hashtbl.copy op_cancel);
+    (* interrupt fibers parked on a condition under a now-cancelled scope *)
+    let hit, live =
+      List.partition (fun (scope, _, _) -> is_cancelled scope) !cond_waiters
+    in
+    cond_waiters := live;
+    List.iter
+      (fun (_, _, k) ->
+        Queue.push (fun () -> discontinue k (Workflow.Canceled "scope canceled")) ready)
+      hit
   in
   let arg =
     match state.init_arg with
@@ -569,13 +581,16 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
               (fun (k : (a, unit) continuation) ->
                 Updates.register name validator handler;
                 continue k ())
-          | Workflow.Wait_condition_effect pred ->
+          | Workflow.Wait_condition_effect { scope; pred } ->
             Some
               (fun (k : (a, unit) continuation) ->
-                (* true now: resume inline. false: park on the predicate for the log
-                   walk to re-check after each event. *)
+                (* true now: resume inline. already cancelled: raise. otherwise park on
+                   the predicate for the log walk to re-check after each event, tagged
+                   with [scope] so a cancel can interrupt it. *)
                 if pred () then continue k ()
-                else cond_waiters := (pred, k) :: !cond_waiters)
+                else if is_cancelled scope then
+                  discontinue k (Workflow.Canceled "scope canceled")
+                else cond_waiters := (scope, pred, k) :: !cond_waiters)
           | _ -> None);
     }
   in
@@ -610,7 +625,12 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
          | None -> ())
        | Signal (name, payload) -> Signals.deliver name payload
        | Update { protocol_instance_id; name; input } ->
-         Updates.deliver protocol_instance_id name input);
+         Updates.deliver protocol_instance_id name input
+       | Cancel_root reason ->
+         (* cancel the workflow: cancel the root scope, which cascades to every
+            non-detached scope and raises Canceled wherever the body is parked *)
+         if reason <> "" then Eio.traceln "[wf] workflow cancellation requested: %s" reason;
+         do_cancel 0);
       run_ready ();
       wake_conditions ();
       run_ready ())

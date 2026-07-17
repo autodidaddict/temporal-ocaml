@@ -246,15 +246,16 @@ type _ Effect.t +=
   | Register_signal_handler_effect :
       string * (Codec.payload -> unit)
       -> unit Effect.t
-  | Wait_condition_effect : (unit -> bool) -> unit Effect.t
+  | Wait_condition_effect : { scope : int; pred : unit -> bool } -> unit Effect.t
 
 let on_signal (_ : _ ctx) (s : 'a Signal.t) (handler : 'a -> unit) : unit =
   Effect.perform
     (Register_signal_handler_effect
        (s.Signal.name, fun p -> handler (Codec.of_payload s.Signal.codec p)))
 
-let wait_condition (_ : _ ctx) (pred : unit -> bool) : unit =
-  Effect.perform (Wait_condition_effect pred)
+(* the scope rides along so cancelling it interrupts a fiber parked here *)
+let wait_condition (ctx : _ ctx) (pred : unit -> bool) : unit =
+  Effect.perform (Wait_condition_effect { scope = ctx.scope; pred })
 
 (* block until [pred] holds or [timeout] seconds elapse; return whether it held in
    time. A watcher fiber sleeps the deadline in a child scope and flips a flag the
