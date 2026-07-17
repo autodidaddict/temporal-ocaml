@@ -196,6 +196,7 @@ pub extern "C" fn temporal_bridge_worker_new(
             enable_remote_activities: true,
             enable_nexus: false,
         })
+        .max_cached_workflows(100usize)
         .max_outstanding_workflow_tasks(100usize)
         .max_outstanding_activities(100usize)
         .versioning_strategy(WorkerVersioningStrategy::None {
