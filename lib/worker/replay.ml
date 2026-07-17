@@ -220,6 +220,15 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
   let timer_waiters : (int, unit -> unit) Hashtbl.t = Hashtbl.create 8 in
   let child_start_waiters : (int, child_start -> unit) Hashtbl.t = Hashtbl.create 8 in
   let child_result_waiters : (int, resolution -> unit) Hashtbl.t = Hashtbl.create 8 in
+  (* a resolution can arrive before the body awaits its op: in a fan-in, a later-seq
+     operation may resolve before the earlier one the fiber is currently awaiting.
+     Every resolution the log walk delivers is buffered here, so an await that registers
+     afterwards still finds it rather than the resolution being dropped. Like the waiter
+     tables, these are rebuilt per activation. *)
+  let act_resolved : (int, resolution) Hashtbl.t = Hashtbl.create 8 in
+  let timer_fired_seen : (int, unit) Hashtbl.t = Hashtbl.create 8 in
+  let child_started_seen : (int, child_start) Hashtbl.t = Hashtbl.create 8 in
+  let child_resolved_seen : (int, resolution) Hashtbl.t = Hashtbl.create 8 in
   (* fibers blocked on a predicate, re-checked after each event; tagged with the scope
      they wait under so a cancel can interrupt them *)
   let cond_waiters : (int * (unit -> bool) * (unit, unit) continuation) list ref =
@@ -418,71 +427,99 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                 let ok p = continue k p
                 and fail label msg = discontinue k (Failure (label ^ msg))
                 and canceled msg = discontinue k (Workflow.Canceled msg) in
-                let park_cancellable key ~remove_waiter ~register_waiter =
-                  (* a raise-on-cancel op raises Canceled at once if its scope is already
-                     cancelled, and installs a hook so a later cancel reaches it while
-                     parked. A wait-on-cancel op always parks and lets the server's
-                     resolution wake it. *)
-                  let raise_on_cancel =
-                    match Hashtbl.find_opt op_cancel key with
-                    | Some s -> s.raise_on_cancel
-                    | None -> true
-                  in
-                  if raise_on_cancel && is_cancelled (Hashtbl.find op_scope key) then
-                    discontinue k (Workflow.Canceled "scope canceled")
-                  else (
-                    register_waiter ();
-                    if raise_on_cancel then
-                      Hashtbl.replace cancel_hook key (fun () ->
-                          remove_waiter ();
-                          Queue.push
-                            (fun () ->
-                              discontinue k (Workflow.Canceled "scope canceled"))
-                            ready))
+                let park_cancellable key ~buffered ~remove_waiter ~register_waiter =
+                  (* if the op already resolved this activation, complete with it now.
+                     Otherwise a raise-on-cancel op raises Canceled at once if its scope
+                     is already cancelled, and installs a hook so a later cancel reaches
+                     it while parked; a wait-on-cancel op always parks and lets the
+                     server's resolution wake it. *)
+                  match buffered () with
+                  | Some deliver -> deliver ()
+                  | None ->
+                    let raise_on_cancel =
+                      match Hashtbl.find_opt op_cancel key with
+                      | Some s -> s.raise_on_cancel
+                      | None -> true
+                    in
+                    if raise_on_cancel && is_cancelled (Hashtbl.find op_scope key) then
+                      discontinue k (Workflow.Canceled "scope canceled")
+                    else (
+                      register_waiter ();
+                      if raise_on_cancel then
+                        Hashtbl.replace cancel_hook key (fun () ->
+                            remove_waiter ();
+                            Queue.push
+                              (fun () ->
+                                discontinue k (Workflow.Canceled "scope canceled"))
+                              ready))
                 in
                 match op with
                 | Workflow.Op_activity s ->
                   let key = Printf.sprintf "act:%d" s in
+                  let complete r =
+                    untrack_op key;
+                    match r with
+                    | R_ok p -> ok p
+                    | R_cancelled msg -> canceled msg
+                    | R_fail msg -> fail "activity failed: " msg
+                  in
                   park_cancellable key
+                    ~buffered:(fun () ->
+                      Option.map (fun r () -> complete r) (Hashtbl.find_opt act_resolved s))
                     ~remove_waiter:(fun () -> Hashtbl.remove act_waiters s)
                     ~register_waiter:(fun () ->
                       Hashtbl.replace act_waiters s (fun r ->
                           Hashtbl.remove act_waiters s;
-                          untrack_op key;
-                          match r with
-                          | R_ok p -> ok p
-                          | R_cancelled msg -> canceled msg
-                          | R_fail msg -> fail "activity failed: " msg))
+                          complete r))
                 | Workflow.Op_timer s ->
                   let key = Printf.sprintf "timer:%d" s in
+                  let complete () =
+                    untrack_op key;
+                    ok (Codec.to_payload Codec.unit ())
+                  in
                   park_cancellable key
+                    ~buffered:(fun () ->
+                      if Hashtbl.mem timer_fired_seen s then Some complete else None)
                     ~remove_waiter:(fun () -> Hashtbl.remove timer_waiters s)
                     ~register_waiter:(fun () ->
                       Hashtbl.replace timer_waiters s (fun () ->
                           Hashtbl.remove timer_waiters s;
-                          untrack_op key;
-                          ok (Codec.to_payload Codec.unit ())))
+                          complete ()))
                 | Workflow.Op_child s ->
                   let key = Printf.sprintf "child:%d" s in
+                  let complete_result r =
+                    untrack_op key;
+                    match r with
+                    | R_ok p -> ok p
+                    | R_cancelled msg -> canceled msg
+                    | R_fail msg -> fail "child workflow failed: " msg
+                  in
+                  (* the child resolves in two stages; the completion may itself already
+                     be buffered by the time the start resolves *)
+                  let on_start cs =
+                    Hashtbl.remove child_start_waiters s;
+                    match cs with
+                    | Child_start_fail msg ->
+                      untrack_op key;
+                      fail "child workflow start failed: " msg
+                    | Child_run _run_id -> (
+                      match Hashtbl.find_opt child_resolved_seen s with
+                      | Some r -> complete_result r
+                      | None ->
+                        Hashtbl.replace child_result_waiters s (fun r ->
+                            Hashtbl.remove child_result_waiters s;
+                            complete_result r))
+                  in
                   park_cancellable key
+                    ~buffered:(fun () ->
+                      Option.map
+                        (fun cs () -> on_start cs)
+                        (Hashtbl.find_opt child_started_seen s))
                     ~remove_waiter:(fun () ->
                       Hashtbl.remove child_start_waiters s;
                       Hashtbl.remove child_result_waiters s)
                     ~register_waiter:(fun () ->
-                      Hashtbl.replace child_start_waiters s (fun cs ->
-                          Hashtbl.remove child_start_waiters s;
-                          match cs with
-                          | Child_start_fail msg ->
-                            untrack_op key;
-                            fail "child workflow start failed: " msg
-                          | Child_run _run_id ->
-                            Hashtbl.replace child_result_waiters s (fun r ->
-                                Hashtbl.remove child_result_waiters s;
-                                untrack_op key;
-                                match r with
-                                | R_ok p -> ok p
-                                | R_cancelled msg -> canceled msg
-                                | R_fail msg -> fail "child workflow failed: " msg)))
+                      Hashtbl.replace child_start_waiters s on_start)
                 | Workflow.Op_fiber id ->
                   let wake = function
                     | Ok () -> ok dummy
@@ -535,7 +572,33 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                       (match Hashtbl.find_opt fiber_outcome id with
                        | Some r -> wake_f r
                        | None -> Hashtbl.replace fiber_waiters id wake_f))
-                  ops)
+                  ops;
+                (* deliver any resolution buffered before these waiters registered; the
+                   first to fire wins via [resolved] *)
+                if not !resolved then
+                  List.iter
+                    (fun op ->
+                      match op with
+                      | Workflow.Op_activity s -> (
+                        match
+                          (Hashtbl.find_opt act_resolved s, Hashtbl.find_opt act_waiters s)
+                        with
+                        | Some r, Some w -> Queue.push (fun () -> w r) ready
+                        | _ -> ())
+                      | Workflow.Op_timer s ->
+                        if Hashtbl.mem timer_fired_seen s then (
+                          match Hashtbl.find_opt timer_waiters s with
+                          | Some w -> Queue.push (fun () -> w ()) ready
+                          | None -> ())
+                      | Workflow.Op_child s -> (
+                        match
+                          ( Hashtbl.find_opt child_started_seen s,
+                            Hashtbl.find_opt child_start_waiters s )
+                        with
+                        | Some cs, Some w -> Queue.push (fun () -> w cs) ready
+                        | _ -> ())
+                      | Workflow.Op_fiber _ -> ())
+                    ops)
           | Workflow.Spawn_effect thunk ->
             Some
               (fun (k : (a, unit) continuation) ->
@@ -607,22 +670,26 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
   List.iter
     (fun ev ->
       (match ev with
-       | Activity_resolved (seq, r) -> (
-         match Hashtbl.find_opt act_waiters seq with
-         | Some w -> Queue.push (fun () -> w r) ready
-         | None -> ())
-       | Timer_fired seq -> (
-         match Hashtbl.find_opt timer_waiters seq with
-         | Some w -> Queue.push (fun () -> w ()) ready
-         | None -> ())
-       | Child_started (seq, cs) -> (
-         match Hashtbl.find_opt child_start_waiters seq with
-         | Some w -> Queue.push (fun () -> w cs) ready
-         | None -> ())
-       | Child_resolved (seq, r) -> (
-         match Hashtbl.find_opt child_result_waiters seq with
-         | Some w -> Queue.push (fun () -> w r) ready
-         | None -> ())
+       | Activity_resolved (seq, r) ->
+         Hashtbl.replace act_resolved seq r;
+         (match Hashtbl.find_opt act_waiters seq with
+          | Some w -> Queue.push (fun () -> w r) ready
+          | None -> ())
+       | Timer_fired seq ->
+         Hashtbl.replace timer_fired_seen seq ();
+         (match Hashtbl.find_opt timer_waiters seq with
+          | Some w -> Queue.push (fun () -> w ()) ready
+          | None -> ())
+       | Child_started (seq, cs) ->
+         Hashtbl.replace child_started_seen seq cs;
+         (match Hashtbl.find_opt child_start_waiters seq with
+          | Some w -> Queue.push (fun () -> w cs) ready
+          | None -> ())
+       | Child_resolved (seq, r) ->
+         Hashtbl.replace child_resolved_seen seq r;
+         (match Hashtbl.find_opt child_result_waiters seq with
+          | Some w -> Queue.push (fun () -> w r) ready
+          | None -> ())
        | Signal (name, payload) -> Signals.deliver name payload
        | Update { protocol_instance_id; name; input } ->
          Updates.deliver protocol_instance_id name input

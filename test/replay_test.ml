@@ -1048,6 +1048,41 @@ let () =
      | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "canceled"
      | _ -> false)
 
+(* out-of-order fan-in: await_all awaits its futures in order, but the server may
+   resolve them in any order. A resolution that arrives before its await is buffered,
+   not dropped, so the workflow still completes. Here the three activities resolve in
+   reverse (seq 3, 2, 1) while the body awaits seq 1 first. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"FanReverseW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let a = Workflow.start_activity ctx echo_act "A" in
+           let b = Workflow.start_activity ctx echo_act "B" in
+           let c = Workflow.start_activity ctx echo_act "C" in
+           String.concat "+" (Workflow.await_all ctx [ a; b; c ])))
+  in
+  let run_id = "wf-fan-reverse" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"FanReverseW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "out-of-order fan-in: schedules all three eagerly"
+    (match c1 with
+     | [ Coresdk.Schedule_activity { seq = 1; _ };
+         Coresdk.Schedule_activity { seq = 2; _ };
+         Coresdk.Schedule_activity { seq = 3; _ } ] ->
+       true
+     | _ -> false);
+  let ok s = Coresdk.Completed (Some (Codec.to_payload Codec.string s)) in
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 3; result = ok "C" });
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 2; result = ok "B" });
+  Replay_state.apply_job st (Coresdk.Resolve_activity { seq = 1; result = ok "A" });
+  let c2 = activation wf st ~run_id ~history_length:4 in
+  check "out-of-order fan-in: completes despite reverse resolution order"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "A+B+C"
+     | _ -> false)
+
 let () =
   if !failures > 0 then (
     Printf.printf "%d replay test(s) failed\n" !failures;
