@@ -58,5 +58,7 @@ let () =
     |> register_workflow approval_workflow
     |> register_workflow buffered_signal_workflow
     |> register_workflow account_workflow
+    |> register_workflow bulk_pack_workflow
+    |> register_workflow saga_checkout_workflow
   in
   Worker.run worker

@@ -136,3 +136,37 @@ let account_workflow =
   on_query ctx balance_query (fun () -> !balance);
   wait_condition ctx (fun () -> !closed);
   !balance
+
+(* Demonstrates in-workflow concurrency: pack every line item at once. Each
+   [start_activity] issues its schedule command eagerly and returns a future without
+   blocking, so the activities run in parallel; [await_all] then waits for them and
+   returns the results in order. *)
+let bulk_pack_workflow =
+  Workflow.define ~name:"BulkPackWorkflow"
+    ~input:(Codec.list Line_item.codec) ~output:Codec.string
+  @@ fun ctx (items : Line_item.t list) ->
+  let packs =
+    List.map (fun item -> start_activity ctx Activities.pick_and_pack [ item ]) items
+  in
+  let results = await_all ctx packs in
+  Printf.sprintf "packed %d item(s) concurrently: %s" (List.length results)
+    (String.concat ", " results)
+
+(* Demonstrates cancellation with a saga-style compensation. The workflow charges
+   the order, then holds on a durable timer. Cancelling the order raises Canceled at
+   the sleep; the handler refunds the charge in a [detached] scope, which ancestor
+   cancellation does not reach, so the refund completes even though the workflow is
+   being canceled. Re-raising Canceled then closes the workflow as canceled. *)
+let saga_checkout_workflow =
+  Workflow.define ~name:"SagaCheckoutWorkflow" ~input:Order.codec ~output:Codec.string
+  @@ fun ctx (o : Order.t) ->
+  let total = execute_activity ~max_attempts:1 ctx Activities.validate_order o in
+  let charge = execute_activity ctx Activities.charge_payment (o.order_id, total) in
+  match sleep ctx 3600.0 with
+  | () ->
+    let reservation = execute_activity ctx Activities.reserve_inventory o.items in
+    Printf.sprintf "order %s: charged %s, reserved %s" o.order_id charge reservation
+  | exception Canceled _ ->
+    detached ctx (fun ctx ->
+        ignore (execute_activity ctx Activities.refund_payment (charge, total)));
+    raise (Canceled "order canceled after charge; refunded")

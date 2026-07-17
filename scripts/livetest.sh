@@ -132,6 +132,28 @@ if r is not None:
     print(r if isinstance(r, str) else json.dumps(r))
 ' 2>/dev/null
 }
+count_events() { # id type-substring -> count of matching history events
+  temporal workflow show --workflow-id "$1" --output json 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print(sum(1 for e in d["events"] if sys.argv[1] in e["eventType"]))
+' "$2" 2>/dev/null
+}
+has_activity() { # id activity-name -> yes|no (was this activity type scheduled?)
+  temporal workflow show --workflow-id "$1" --output json 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+names = {e["activityTaskScheduledEventAttributes"]["activityType"]["name"]
+         for e in d["events"] if "activityTaskScheduledEventAttributes" in e}
+print("yes" if sys.argv[1] in names else "no")
+' "$2" 2>/dev/null
+}
+await_history() { # id type-substring: poll until an event of this type appears
+  for _ in $(seq 1 30); do
+    case "$(has_events "$1" "$2")" in yes) return 0 ;; *) sleep 1 ;; esac
+  done
+  return 1
+}
 
 # ---- scenario 1 + 2: happy path with a durable timer --------------------------
 log "scenario 1+2: happy path + durable timer"
@@ -242,6 +264,55 @@ st="$(await_terminal smoke-acct)"
 case "$st" in *COMPLETED) pass "account workflow COMPLETED" ;; *) fail "account status: $st" ;; esac
 res="$(result smoke-acct)"
 case "$res" in *175*) pass "final balance 175" ;; *) fail "account result: $res" ;; esac
+
+# ---- scenario 9: workflow cancellation ----------------------------------------
+log "scenario 9: cancel a workflow blocked on wait_condition"
+# the workflow blocks in wait_condition; a CancelWorkflow interrupts that wait with
+# Canceled, which escapes the body and closes the run as CANCELED (rather than hanging
+# on a signal that is no longer coming).
+start_wf smoke-cancel ApprovalWorkflow '"expense-cancel"'
+sleep 2
+temporal workflow cancel --workflow-id smoke-cancel >/dev/null 2>&1
+st="$(await_terminal smoke-cancel)"
+case "$st" in
+  *CANCELED|*Canceled|*CANCELLED|*Cancelled) pass "canceled workflow reaches CANCELED" ;;
+  *) fail "cancel status: $st" ;;
+esac
+
+# ---- scenario 10: parallel fan-out --------------------------------------------
+log "scenario 10: parallel fan-out with start_activity + await_all"
+items='[{"sku":"A","qty":1,"unit_price":100},{"sku":"B","qty":1,"unit_price":100},{"sku":"C","qty":1,"unit_price":100}]'
+start_wf smoke-fanout BulkPackWorkflow "$items"
+st="$(await_terminal smoke-fanout)"
+case "$st" in *COMPLETED) pass "fan-out workflow COMPLETED" ;; *) fail "fanout status: $st" ;; esac
+res="$(result smoke-fanout)"
+case "$res" in *"packed 3 item(s) concurrently"*) pass "fanned out and joined 3 activities" ;; *) fail "fanout result: $res" ;; esac
+# all three pack activities were scheduled (started eagerly, before any resolved)
+case "$(count_events smoke-fanout ACTIVITY_TASK_SCHEDULED)" in
+  3) pass "three activities scheduled concurrently" ;;
+  *) fail "expected 3 scheduled activities, got $(count_events smoke-fanout ACTIVITY_TASK_SCHEDULED)" ;;
+esac
+
+# ---- scenario 11: cancellation with saga compensation -------------------------
+log "scenario 11: cancel triggers a detached refund (saga compensation)"
+# the workflow charges, then holds on a durable timer. Cancelling it raises Canceled
+# at the sleep; the handler refunds in a detached scope (which the cancel does not
+# reach), so the refund runs before the workflow closes as CANCELED.
+start_wf smoke-saga SagaCheckoutWorkflow "$order"
+if await_history smoke-saga TIMER_STARTED; then
+  temporal workflow cancel --workflow-id smoke-saga >/dev/null 2>&1
+  st="$(await_terminal smoke-saga)"
+  case "$st" in
+    *CANCELED|*Canceled|*CANCELLED|*Cancelled) pass "saga workflow reaches CANCELED" ;;
+    *) fail "saga status: $st" ;;
+  esac
+  case "$(has_activity smoke-saga refund_payment)" in
+    yes) pass "detached refund compensation ran during cancellation" ;;
+    *) fail "no refund_payment activity in saga history" ;;
+  esac
+else
+  fail "saga never reached its hold window (no TIMER_STARTED)"
+fi
 
 # ---- summary ------------------------------------------------------------------
 echo

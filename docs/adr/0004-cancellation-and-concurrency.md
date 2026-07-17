@@ -1,6 +1,6 @@
 # 4. Cancellation and in-workflow concurrency
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-15
 
 ## Context
@@ -415,33 +415,49 @@ Field tags pinned against the vendored prost-generated protos
   operation against a timeout, so a typed heterogeneous `select` can be added later
   over the same futures without reshaping the model.
 
-## Open questions (for implementation)
+## Resolutions
 
-- **Within-activation scheduling order** - The precise, documented rule for which fiber
-  runs next and when the log advances, so the interleaving is pinned. This is the
-  analogue of ADR-0002's "which signals are delivered at which checkpoint" question.
-- **Emit-once for a single outstanding operation** - Confirm whether today's
-  single-fiber path already re-emits a start command on a signal-triggered re-run, and
-  whether sdk-core tolerates it, independent of the concurrency change.
-- **Timer cancel resolution** - Confirm sdk-core sends no activation job for a
-  cancelled timer, so the local resolution is the correct model.
-- **`Canceled` and the failure taxonomy** - `Canceled` is the first concrete member of
-  ADR-0001's deferred `Failure` taxonomy (`CanceledFailureInfo`). Decide how much
-  structured detail, such as reason and cause chain, to carry now versus later when
-  the ADR-0001 failure converter lands.
-- **`await_any` and losers** - Whether to keep pure `Promise.race` semantics, where
-  losers run on, or offer a structured `race` that cancels the losing branch in a
-  child scope.
-- **Scope identity across replay** - Confirm a deterministic scope id, such as a scope
-  counter like the operation seqs, suffices, and that `with_timeout`'s internal timer
-  seq interleaves cleanly with body timers.
-- **Heartbeating** - `Wait_cancellation_completed` and activity-side cancellation
-  observation depend on the activity heartbeat and context, which do not exist yet.
-  Sequence that work relative to this ADR.
-- **`wait_condition_timeout` naming and return** - Confirm the two-function split
-  (`wait_condition : … -> unit`, `wait_condition_timeout : … -> bool`) over a single
-  `?timeout` entry point. This matches Java's two `await` overloads rather than
-  TypeScript's single one.
+The design landed across phases 0 through 8; `main` is the source of truth. Each open
+question was settled as follows.
+
+- **Within-activation scheduling order** - A cooperative FIFO ready queue. A fiber
+  becomes runnable when the operation it awaits resolves or the predicate it waits on
+  holds, and the queue drains in that order; the history log advances one event at a
+  time (phase 1).
+- **Emit-once for a single outstanding operation** - The single-fiber path did re-emit
+  a start command on a signal-triggered re-run, and sdk-core tolerates it. Emit-once,
+  via an issued-key set in the run state, was added regardless so that with several
+  operations outstanding each is issued once (phase 2).
+- **Timer cancel resolution** - sdk-core delivers no FireTimer for a cancelled timer.
+  Cancelling a scope with an outstanding timer emits CancelTimer and resolves the timer
+  locally as Canceled (phase 6).
+- **`Canceled` and the failure taxonomy** - `Canceled` carries a reason string only.
+  The structured detail from ADR-0001's `Failure` taxonomy is deferred to the failure
+  converter.
+- **`await_any` and losers** - Promise.race semantics: the losers keep running. A scope
+  cancel does not yet interrupt a fiber parked in `await_any`, since its per-operation
+  waiters are registered without a cancel hook. This is a known limitation, left for a
+  later structured `race`.
+- **Scope identity across replay** - A plain int scope counter, assigned as the body
+  runs. `with_timeout`'s internal timer draws from the same timer sequence as body
+  timers, so it interleaves deterministically (phases 4 and 5).
+- **Heartbeating** - Still absent. `Wait_cancellation_completed` requests cancellation
+  and then waits for the server's resolution, which today mostly reaches an activity
+  that has not started (phase 6).
+- **`wait_condition_timeout` naming and return** - The two-function split
+  (`wait_condition : _ ctx -> (unit -> bool) -> unit` and
+  `wait_condition_timeout : _ ctx -> timeout:float -> (unit -> bool) -> bool`), matching
+  Java's two `await` overloads (phase 5).
+
+Two behaviors surfaced only against a live server during phase 8 integration.
+
+- **Out-of-order fan-in** - The server resolves operations in completion order, not the
+  order the body awaits them. A resolution that arrives before its await is buffered for
+  the activation rather than dropped, so `await_all` over several operations completes
+  whatever the resolution order.
+- **Sticky workflow cache** - The worker sets `max_cached_workflows`, so sdk-core keeps
+  a run cached and sends incremental activations. Without it every workflow task is a
+  full replay, and under concurrent load the single worker loop falls behind.
 
 ## References
 
