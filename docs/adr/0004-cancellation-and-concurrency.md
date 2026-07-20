@@ -434,10 +434,11 @@ question was settled as follows.
 - **`Canceled` and the failure taxonomy** - `Canceled` carries a reason string only.
   The structured detail from ADR-0001's `Failure` taxonomy is deferred to the failure
   converter.
-- **`await_any` and losers** - Promise.race semantics: the losers keep running. A scope
-  cancel does not yet interrupt a fiber parked in `await_any`, since its per-operation
-  waiters are registered without a cancel hook. This is a known limitation, left for a
-  later structured `race`.
+- **`await_any` and losers** - Promise.race semantics: when one operation resolves the
+  losers keep running. A scope cancel interrupts a fiber parked in `await_any`, raising
+  Canceled at the await point as a single await would, and an await under an
+  already-cancelled scope raises at once. A structured `race` that cancels the losing
+  branch on a win is still future work.
 - **Scope identity across replay** - A plain int scope counter, assigned as the body
   runs. `with_timeout`'s internal timer draws from the same timer sequence as body
   timers, so it interleaves deterministically (phases 4 and 5).

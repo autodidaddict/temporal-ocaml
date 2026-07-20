@@ -1048,6 +1048,76 @@ let () =
      | [ Coresdk.Complete_workflow_execution (Some p) ] -> Codec.of_payload Codec.string p = "canceled"
      | _ -> false)
 
+(* await_any cancellation: a scope cancel interrupts a fiber parked in await_any,
+   raising Canceled at the await point. Uncaught, it closes the run as canceled. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"RaceCancelW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let a = Workflow.start_activity ctx echo_act "A" in
+           let b = Workflow.start_activity ctx echo_act "B" in
+           Workflow.await_any ctx [ a; b ]))
+  in
+  let run_id = "wf-race-cancel" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"RaceCancelW" ~workflow_id:run_id [ unit_arg ]);
+  let c1 = activation wf st ~run_id ~history_length:1 in
+  check "await_any cancel: schedules both raced activities"
+    (match c1 with
+     | [ Coresdk.Schedule_activity { seq = 1; _ }; Coresdk.Schedule_activity { seq = 2; _ } ] -> true
+     | _ -> false);
+  Replay_state.apply_job st (Coresdk.Cancel_workflow { reason = "" });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "await_any cancel: an interrupted await_any escapes as CancelWorkflowExecution"
+    (match c2 with [ Coresdk.Cancel_workflow_execution ] -> true | _ -> false)
+
+(* await_any cancellation, caught: the body may catch the Canceled and complete. *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"RaceCancelCatchW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let a = Workflow.start_activity ctx echo_act "A" in
+           let b = Workflow.start_activity ctx echo_act "B" in
+           try Workflow.await_any ctx [ a; b ] with Workflow.Canceled _ -> "raced-canceled"))
+  in
+  let run_id = "wf-race-cancel-catch" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"RaceCancelCatchW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st (Coresdk.Cancel_workflow { reason = "" });
+  let c2 = activation wf st ~run_id ~history_length:2 in
+  check "await_any cancel: the body may catch Canceled from an interrupted await_any"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "raced-canceled"
+     | _ -> false)
+
+(* await_any under an already-cancelled scope raises Canceled at once (the upfront
+   check, mirroring a single await). *)
+let () =
+  let wf =
+    Workflow.reg
+      (Workflow.define ~name:"RacePreCancelW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           Workflow.with_cancel_scope ctx (fun ctx' ~cancel ->
+               let a = Workflow.start_activity ctx' echo_act "A" in
+               let b = Workflow.start_activity ctx' echo_act "B" in
+               cancel ();
+               try Workflow.await_any ctx' [ a; b ] with Workflow.Canceled _ -> "pre-canceled")))
+  in
+  let run_id = "wf-race-precancel" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st (init_job ~workflow_type:"RacePreCancelW" ~workflow_id:run_id [ unit_arg ]);
+  let c = activation wf st ~run_id ~history_length:1 in
+  check "await_any cancel: awaiting under an already-cancelled scope raises Canceled"
+    (match c with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "pre-canceled"
+     | _ -> false)
+
 (* out-of-order fan-in: await_all awaits its futures in order, but the server may
    resolve them in any order. A resolution that arrives before its await is buffered,
    not dropped, so the workflow still completes. Here the three activities resolve in

@@ -531,47 +531,77 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
           | Workflow.Await_any_effect ops ->
             Some
               (fun (k : (a, unit) continuation) ->
-                (* park on every op; the first to resolve wakes the fiber with its
-                   index and payload, and the rest become no-ops *)
+                (* park on every op; the first to resolve wakes the fiber with its index
+                   and payload. A cancel that reaches a raise-on-cancel op's scope wakes
+                   it with Canceled instead. Once one fires, the rest become no-ops and
+                   their waiters and hooks are dropped. *)
                 let resolved = ref false in
+                let key_of = function
+                  | Workflow.Op_activity s -> Some (Printf.sprintf "act:%d" s)
+                  | Workflow.Op_timer s -> Some (Printf.sprintf "timer:%d" s)
+                  | Workflow.Op_child s -> Some (Printf.sprintf "child:%d" s)
+                  | Workflow.Op_fiber _ -> None
+                in
+                let cleanup () =
+                  List.iter
+                    (fun op ->
+                      (match op with
+                       | Workflow.Op_activity s -> Hashtbl.remove act_waiters s
+                       | Workflow.Op_timer s -> Hashtbl.remove timer_waiters s
+                       | Workflow.Op_child s ->
+                         Hashtbl.remove child_start_waiters s;
+                         Hashtbl.remove child_result_waiters s
+                       | Workflow.Op_fiber id -> Hashtbl.remove fiber_waiters id);
+                      match key_of op with
+                      | Some key -> Hashtbl.remove cancel_hook key
+                      | None -> ())
+                    ops
+                in
                 let wake idx r =
                   if not !resolved then (
                     resolved := true;
+                    cleanup ();
                     match r with
                     | R_ok p -> continue k (idx, p)
                     | R_cancelled msg -> discontinue k (Workflow.Canceled msg)
                     | R_fail msg ->
                       discontinue k (Failure ("awaited operation failed: " ^ msg)))
                 in
+                let cancel () =
+                  if not !resolved then (
+                    resolved := true;
+                    cleanup ();
+                    discontinue k (Workflow.Canceled "scope canceled"))
+                in
                 List.iteri
                   (fun idx op ->
-                    match op with
-                    | Workflow.Op_activity s ->
-                      Hashtbl.replace act_waiters s (fun r ->
-                          Hashtbl.remove act_waiters s;
-                          wake idx r)
-                    | Workflow.Op_timer s ->
-                      Hashtbl.replace timer_waiters s (fun () ->
-                          Hashtbl.remove timer_waiters s;
-                          wake idx (R_ok (Codec.to_payload Codec.unit ())))
-                    | Workflow.Op_child s ->
-                      Hashtbl.replace child_start_waiters s (fun cs ->
-                          Hashtbl.remove child_start_waiters s;
-                          match cs with
-                          | Child_start_fail msg ->
-                            wake idx (R_fail ("child workflow start failed: " ^ msg))
-                          | Child_run _run_id ->
-                            Hashtbl.replace child_result_waiters s (fun r ->
-                                Hashtbl.remove child_result_waiters s;
-                                wake idx r))
-                    | Workflow.Op_fiber id ->
-                      let wake_f = function
-                        | Ok () -> wake idx (R_ok dummy)
-                        | Error exn -> wake idx (R_fail (Printexc.to_string exn))
-                      in
-                      (match Hashtbl.find_opt fiber_outcome id with
-                       | Some r -> wake_f r
-                       | None -> Hashtbl.replace fiber_waiters id wake_f))
+                    (match op with
+                     | Workflow.Op_activity s ->
+                       Hashtbl.replace act_waiters s (fun r -> wake idx r)
+                     | Workflow.Op_timer s ->
+                       Hashtbl.replace timer_waiters s (fun () ->
+                           wake idx (R_ok (Codec.to_payload Codec.unit ())))
+                     | Workflow.Op_child s ->
+                       Hashtbl.replace child_start_waiters s (fun cs ->
+                           match cs with
+                           | Child_start_fail msg ->
+                             wake idx (R_fail ("child workflow start failed: " ^ msg))
+                           | Child_run _run_id ->
+                             Hashtbl.replace child_result_waiters s (fun r -> wake idx r))
+                     | Workflow.Op_fiber id ->
+                       let wake_f = function
+                         | Ok () -> wake idx (R_ok dummy)
+                         | Error exn -> wake idx (R_fail (Printexc.to_string exn))
+                       in
+                       (match Hashtbl.find_opt fiber_outcome id with
+                        | Some r -> wake_f r
+                        | None -> Hashtbl.replace fiber_waiters id wake_f));
+                    (* do_cancel runs this hook for a cancelled raise-on-cancel op; it
+                       schedules the wake so do_cancel finishes its own iteration first *)
+                    match key_of op with
+                    | Some key ->
+                      Hashtbl.replace cancel_hook key (fun () -> Queue.push cancel ready)
+                    | None -> ())
                   ops;
                 (* deliver any resolution buffered before these waiters registered; the
                    first to fire wins via [resolved] *)
@@ -598,6 +628,22 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
                         | Some cs, Some w -> Queue.push (fun () -> w cs) ready
                         | _ -> ())
                       | Workflow.Op_fiber _ -> ())
+                    ops;
+                (* an op whose scope is already cancelled wakes await_any too; scheduled
+                   after the buffer sweep so a buffered resolution still wins *)
+                if not !resolved then
+                  List.iter
+                    (fun op ->
+                      match key_of op with
+                      | Some key ->
+                        let raise_on_cancel =
+                          match Hashtbl.find_opt op_cancel key with
+                          | Some s -> s.raise_on_cancel
+                          | None -> true
+                        in
+                        if raise_on_cancel && is_cancelled (Hashtbl.find op_scope key)
+                        then Queue.push cancel ready
+                      | None -> ())
                     ops)
           | Workflow.Spawn_effect thunk ->
             Some
