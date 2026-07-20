@@ -60,5 +60,6 @@ let () =
     |> register_workflow account_workflow
     |> register_workflow bulk_pack_workflow
     |> register_workflow saga_checkout_workflow
+    |> register_workflow race_workflow
   in
   Worker.run worker

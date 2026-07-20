@@ -170,3 +170,14 @@ let saga_checkout_workflow =
     detached ctx (fun ctx ->
         ignore (execute_activity ctx Activities.refund_payment (charge, total)));
     raise (Canceled "order canceled after charge; refunded")
+
+(* Demonstrates await_any under cancellation: the workflow races two durable timers and
+   parks in await_any. Cancelling the workflow interrupts that wait with Canceled, which
+   escapes the body and closes the run as canceled rather than leaving it parked. *)
+let race_workflow =
+  Workflow.define ~name:"RaceWorkflow" ~input:Codec.string ~output:Codec.string
+  @@ fun ctx (label : string) ->
+  let t1 = start_timer ctx 3600.0 in
+  let t2 = start_timer ctx 3600.0 in
+  ignore (await_any ctx [ t1; t2 ]);
+  label ^ ":raced"

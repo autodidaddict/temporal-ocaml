@@ -314,6 +314,22 @@ else
   fail "saga never reached its hold window (no TIMER_STARTED)"
 fi
 
+# ---- scenario 12: await_any interrupted by cancellation -----------------------
+log "scenario 12: cancel a workflow parked in await_any"
+# the workflow races two long timers and parks in await_any. Cancelling it interrupts
+# the race with Canceled, which escapes the body and closes the run as CANCELED.
+start_wf smoke-race RaceWorkflow '"race"'
+if await_history smoke-race TIMER_STARTED; then
+  temporal workflow cancel --workflow-id smoke-race >/dev/null 2>&1
+  st="$(await_terminal smoke-race)"
+  case "$st" in
+    *CANCELED|*Canceled|*CANCELLED|*Cancelled) pass "await_any interrupted by cancel reaches CANCELED" ;;
+    *) fail "race status: $st" ;;
+  esac
+else
+  fail "race workflow never started its timers"
+fi
+
 # ---- summary ------------------------------------------------------------------
 echo
 if [ "$fails" -eq 0 ]; then
