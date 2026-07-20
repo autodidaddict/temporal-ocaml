@@ -22,6 +22,7 @@ type 'input ctx = {
   continue_as_new_suggested : bool; (* this activation *)
   history_length : int; (* events in this run's history so far *)
   encode_input : 'input -> Codec.payload; (* the workflow's own input codec *)
+  scope : int; (* current cancellation scope id; 0 is the root scope *)
 }
 
 type ('i, 'o) t = {
@@ -40,20 +41,43 @@ type op = Op_activity of int | Op_timer of int | Op_child of int | Op_fiber of i
 (* What happens to a running child when the parent closes. *)
 type parent_close_policy = Terminate | Abandon | Request_cancel
 
+(* How an activity reacts when its enclosing scope is cancelled. Try_cancel (the
+   default, matching sdk-core and the Go/Java/Python default) requests cancellation and
+   resolves the await with Canceled at once. Wait_cancellation_completed requests it and
+   waits for the activity's own resolution (needs heartbeating, not yet implemented, so
+   today it mostly affects an activity that has not started). Abandon resolves with
+   Canceled at once and sends no cancel request. *)
+type activity_cancel_type = Try_cancel | Wait_cancellation_completed | Abandon
+
+(* sdk-core ActivityCancellationType: 0=TRY_CANCEL 1=WAIT_CANCELLATION_COMPLETED 2=ABANDON *)
+let int_of_cancel_type = function
+  | Try_cancel -> 0
+  | Wait_cancellation_completed -> 1
+  | Abandon -> 2
+
+(* Raised at an await point inside a cancelled scope, and by an await whose operation
+   is already cancelled. An ordinary exception: catch it to compensate, then re-raise
+   to propagate the cancel or return normally to deny it. *)
+exception Canceled of string
+
 (* start_* emit their command eagerly (once) and return the operation's handle
    without blocking; await parks the fiber on a handle until the operation resolves.
+   Each start carries the [scope] it runs under, so cancelling that scope reaches it.
    The worker (replay.ml) performs the emission and the parking; these effects live
    here with their performers. *)
 type _ Effect.t +=
   | Start_activity_effect : {
+      scope : int;
       activity_type : string;
       arg : Codec.payload;
       start_to_close : float;
       max_attempts : int;
+      cancel_type : int; (* ActivityCancellationType, see int_of_cancel_type *)
     }
       -> op Effect.t
-  | Start_timer_effect : { start_to_fire : float } -> op Effect.t
+  | Start_timer_effect : { scope : int; start_to_fire : float } -> op Effect.t
   | Start_child_effect : {
+      scope : int;
       workflow_id : string option;
       workflow_type : string;
       input : Codec.payload;
@@ -61,11 +85,16 @@ type _ Effect.t +=
       parent_close_policy : int; (* 1=TERMINATE 2=ABANDON 3=REQUEST_CANCEL *)
       execution_timeout : float;
       run_timeout : float;
+      wait_for_cancellation : bool; (* on cancel, wait for the child's resolution *)
     }
       -> op Effect.t
   | Await_effect : op -> Codec.payload Effect.t
   | Await_any_effect : op list -> (int * Codec.payload) Effect.t
   | Spawn_effect : (unit -> unit) -> op Effect.t
+  (* cancellation scopes: create a child scope, cancel one, or check a scope *)
+  | New_scope_effect : { parent : int; detached : bool } -> int Effect.t
+  | Cancel_scope_effect : int -> unit Effect.t
+  | Cancel_requested_effect : int -> bool Effect.t
 
 (* a handle to a not-yet-ready result: the pending operation plus how to decode it *)
 type 'a future = { op : op; decode : Codec.payload -> 'a }
@@ -92,31 +121,35 @@ let spawn (_ : _ ctx) (f : unit -> 'a) : 'a future =
   let op = Effect.perform (Spawn_effect (fun () -> cell := Some (f ()))) in
   { op; decode = (fun _ -> match !cell with Some v -> v | None -> raise Not_found) }
 
-let start_activity ?(start_to_close = 10.0) ?(max_attempts = 0) (_ : _ ctx)
-    (a : ('i, 'o) Activity.t) (input : 'i) : 'o future =
+let start_activity ?(start_to_close = 10.0) ?(max_attempts = 0)
+    ?(cancel_type = Try_cancel) (ctx : _ ctx) (a : ('i, 'o) Activity.t) (input : 'i) :
+    'o future =
   let arg = Codec.to_payload a.Activity.input input in
   let op =
     Effect.perform
       (Start_activity_effect
-         { activity_type = a.Activity.name; arg; start_to_close; max_attempts })
+         { scope = ctx.scope; activity_type = a.Activity.name; arg; start_to_close;
+           max_attempts; cancel_type = int_of_cancel_type cancel_type })
   in
   { op; decode = Codec.of_payload a.Activity.output }
 
 (* execute_activity is start-and-await: schedule [activity], wait for it, and return
    the result (raising at the call site if it failed) *)
-let execute_activity ?start_to_close ?max_attempts ctx a input =
-  await ctx (start_activity ?start_to_close ?max_attempts ctx a input)
+let execute_activity ?start_to_close ?max_attempts ?cancel_type ctx a input =
+  await ctx (start_activity ?start_to_close ?max_attempts ?cancel_type ctx a input)
 
-let start_timer (_ : _ ctx) (seconds : float) : unit future =
-  let op = Effect.perform (Start_timer_effect { start_to_fire = seconds }) in
+let start_timer (ctx : _ ctx) (seconds : float) : unit future =
+  let op =
+    Effect.perform (Start_timer_effect { scope = ctx.scope; start_to_fire = seconds })
+  in
   { op; decode = (fun _ -> ()) }
 
 (* sleep is start-and-await over a durable timer *)
 let sleep ctx (seconds : float) : unit = await ctx (start_timer ctx seconds)
 
 let start_child_workflow ?workflow_id ?task_queue ?(parent_close_policy = Terminate)
-    ?(execution_timeout = 0.) ?(run_timeout = 0.) (_ : _ ctx) (w : ('i, 'o) t)
-    (input : 'i) : 'o future =
+    ?(execution_timeout = 0.) ?(run_timeout = 0.) ?(wait_for_cancellation = false)
+    (ctx : _ ctx) (w : ('i, 'o) t) (input : 'i) : 'o future =
   let policy =
     match parent_close_policy with
     | Terminate -> 1
@@ -127,23 +160,63 @@ let start_child_workflow ?workflow_id ?task_queue ?(parent_close_policy = Termin
   let op =
     Effect.perform
       (Start_child_effect
-         { workflow_id;
+         { scope = ctx.scope;
+           workflow_id;
            workflow_type = w.name;
            input = arg;
            task_queue;
            parent_close_policy = policy;
            execution_timeout;
            run_timeout;
+           wait_for_cancellation;
          })
   in
   { op; decode = Codec.of_payload w.output }
 
 (* execute_child_workflow is start-and-await: start the child and wait for it *)
 let execute_child_workflow ?workflow_id ?task_queue ?parent_close_policy
-    ?execution_timeout ?run_timeout ctx w input =
+    ?execution_timeout ?run_timeout ?wait_for_cancellation ctx w input =
   await ctx
     (start_child_workflow ?workflow_id ?task_queue ?parent_close_policy
-       ?execution_timeout ?run_timeout ctx w input)
+       ?execution_timeout ?run_timeout ?wait_for_cancellation ctx w input)
+
+(* run [f] in a fresh cancellable child scope. [cancel ()] cancels every operation
+   started under the child ctx, raising Canceled in fibers awaiting them. *)
+let with_cancel_scope (ctx : 'i ctx) (f : 'i ctx -> cancel:(unit -> unit) -> 'a) : 'a =
+  let sid = Effect.perform (New_scope_effect { parent = ctx.scope; detached = false }) in
+  let cancel () = Effect.perform (Cancel_scope_effect sid) in
+  f { ctx with scope = sid } ~cancel
+
+(* run [f] in a detached child scope. Ancestor cancellation does not reach a detached
+   scope, so post-cancel cleanup started under it runs to completion. *)
+let detached (ctx : 'i ctx) (f : 'i ctx -> 'a) : 'a =
+  let sid = Effect.perform (New_scope_effect { parent = ctx.scope; detached = true }) in
+  f { ctx with scope = sid }
+
+(* run [f] in a fresh child scope that auto-cancels after [seconds]. A watcher fiber
+   sleeps the deadline in a sibling scope; when it fires it cancels the body scope,
+   raising Canceled in [f]. When [f] finishes first, its deadline timer is cancelled.
+   Canceled from a fired deadline propagates out, for the caller to handle. *)
+let with_timeout (ctx : 'i ctx) (seconds : float) (f : 'i ctx -> 'a) : 'a =
+  let body_scope =
+    Effect.perform (New_scope_effect { parent = ctx.scope; detached = false })
+  in
+  let timer_scope =
+    Effect.perform (New_scope_effect { parent = ctx.scope; detached = false })
+  in
+  let ctx_timer = { ctx with scope = timer_scope } in
+  let (_ : unit future) =
+    spawn ctx_timer (fun () ->
+        sleep ctx_timer seconds;
+        Effect.perform (Cancel_scope_effect body_scope))
+  in
+  Fun.protect
+    ~finally:(fun () -> Effect.perform (Cancel_scope_effect timer_scope))
+    (fun () -> f { ctx with scope = body_scope })
+
+(* whether the current scope has been asked to cancel; for cooperative checks *)
+let is_cancel_requested (ctx : _ ctx) : bool =
+  Effect.perform (Cancel_requested_effect ctx.scope)
 
 (* continue_as_new ends this run and atomically starts a fresh one (same workflow
    id, new run id, empty history) with new input; the handler emits the terminal
@@ -173,15 +246,39 @@ type _ Effect.t +=
   | Register_signal_handler_effect :
       string * (Codec.payload -> unit)
       -> unit Effect.t
-  | Wait_condition_effect : (unit -> bool) -> unit Effect.t
+  | Wait_condition_effect : { scope : int; pred : unit -> bool } -> unit Effect.t
 
 let on_signal (_ : _ ctx) (s : 'a Signal.t) (handler : 'a -> unit) : unit =
   Effect.perform
     (Register_signal_handler_effect
        (s.Signal.name, fun p -> handler (Codec.of_payload s.Signal.codec p)))
 
-let wait_condition (_ : _ ctx) (pred : unit -> bool) : unit =
-  Effect.perform (Wait_condition_effect pred)
+(* the scope rides along so cancelling it interrupts a fiber parked here *)
+let wait_condition (ctx : _ ctx) (pred : unit -> bool) : unit =
+  Effect.perform (Wait_condition_effect { scope = ctx.scope; pred })
+
+(* block until [pred] holds or [timeout] seconds elapse; return whether it held in
+   time. A watcher fiber sleeps the deadline in a child scope and flips a flag the
+   predicate reads; when [pred] wins first the deadline timer is cancelled. *)
+let wait_condition_timeout (ctx : _ ctx) ~(timeout : float) (pred : unit -> bool) :
+    bool =
+  if pred () then true
+  else begin
+    let timer_scope =
+      Effect.perform (New_scope_effect { parent = ctx.scope; detached = false })
+    in
+    let ctx_timer = { ctx with scope = timer_scope } in
+    let timed_out = ref false in
+    let (_ : unit future) =
+      spawn ctx_timer (fun () ->
+          sleep ctx_timer timeout;
+          timed_out := true)
+    in
+    wait_condition ctx (fun () -> pred () || !timed_out);
+    let met = pred () in
+    Effect.perform (Cancel_scope_effect timer_scope);
+    met
+  end
 
 (* on_query registers a read-only handler (the query's decoder and encoder wrapped
    around the user's callback). The worker collects these while replaying the body
@@ -247,6 +344,7 @@ let reg (t : (_, _) t) =
             continue_as_new_suggested = can_suggested;
             history_length;
             encode_input = Codec.to_payload t.input;
+            scope = 0;
           }
         in
         Codec.to_payload t.output (t.run ctx (Codec.of_payload t.input p))) }

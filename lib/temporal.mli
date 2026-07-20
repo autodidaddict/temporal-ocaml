@@ -116,9 +116,18 @@ module Workflow : sig
     ('input, 'output) t
   (** [define ~name ~input ~output f] declares a workflow called [name]. *)
 
+  type activity_cancel_type =
+    | Try_cancel  (** request cancellation and raise {!Canceled} at once (default) *)
+    | Wait_cancellation_completed
+        (** request cancellation, then raise {!Canceled} only once the activity's own
+            resolution arrives. This needs activity heartbeating, which does not exist
+            yet, so today it mostly affects an activity that has not started. *)
+    | Abandon  (** raise {!Canceled} at once and send no cancellation request *)
+
   val execute_activity :
     ?start_to_close:float ->
     ?max_attempts:int ->
+    ?cancel_type:activity_cancel_type ->
     _ ctx ->
     ('i, 'o) Activity.t ->
     'i ->
@@ -128,7 +137,8 @@ module Workflow : sig
       seconds (default 10). [max_attempts] caps retries: 1 disables retries, 0
       (the default) leaves it unlimited (bounded by the timeouts). An activity
       that exhausts its attempts resolves as a failure, which raises in the
-      workflow body at the call site. *)
+      workflow body at the call site. [cancel_type] selects how a cancel of the
+      enclosing scope reaches the activity (default {!Try_cancel}). *)
 
   type parent_close_policy =
     | Terminate  (** terminate the child when the parent closes (default) *)
@@ -141,6 +151,7 @@ module Workflow : sig
     ?parent_close_policy:parent_close_policy ->
     ?execution_timeout:float ->
     ?run_timeout:float ->
+    ?wait_for_cancellation:bool ->
     _ ctx ->
     ('i, 'o) t ->
     'i ->
@@ -149,8 +160,11 @@ module Workflow : sig
       own workflow definition) as a child workflow, waits for it, and returns its
       result. [workflow_id] defaults to a deterministic id derived from the
       parent's id; [task_queue] defaults to the parent's; [parent_close_policy]
-      defaults to [Terminate]. A child that fails or is cancelled raises at the
-      call site, like a failed activity. *)
+      defaults to [Terminate]. A child that fails raises at the call site like a
+      failed activity, and a cancelled child raises {!Canceled}. If
+      [wait_for_cancellation] is set, cancelling the enclosing scope requests the
+      child's cancellation and then waits for the child to actually end before
+      raising, rather than raising at once (default [false]). *)
 
   val sleep : _ ctx -> float -> unit
   (** [sleep ctx seconds] durably suspends the workflow for [seconds] via a
@@ -160,6 +174,7 @@ module Workflow : sig
   val start_activity :
     ?start_to_close:float ->
     ?max_attempts:int ->
+    ?cancel_type:activity_cancel_type ->
     _ ctx ->
     ('i, 'o) Activity.t ->
     'i ->
@@ -178,6 +193,7 @@ module Workflow : sig
     ?parent_close_policy:parent_close_policy ->
     ?execution_timeout:float ->
     ?run_timeout:float ->
+    ?wait_for_cancellation:bool ->
     _ ctx ->
     ('i, 'o) t ->
     'i ->
@@ -205,6 +221,30 @@ module Workflow : sig
       rest of the workflow, and returns a future for its result. Use it for
       independent concurrent control flow; to fan out operations, [start_*] plus
       {!await_all} is simpler. *)
+
+  exception Canceled of string
+  (** Raised at an await point inside a cancelled scope. Catch it to compensate and
+      re-raise to propagate the cancel, or return normally to deny it. *)
+
+  val with_cancel_scope : 'i ctx -> ('i ctx -> cancel:(unit -> unit) -> 'a) -> 'a
+  (** [with_cancel_scope ctx (fun ctx' ~cancel -> ...)] runs the body in a fresh
+      cancellable child scope. [cancel ()] cancels every operation started under
+      [ctx'], emitting its cancel command and raising {!Canceled} in fibers awaiting
+      it; an await under an already-cancelled scope raises at once. *)
+
+  val with_timeout : 'i ctx -> float -> ('i ctx -> 'a) -> 'a
+  (** [with_timeout ctx seconds f] runs [f] in a child scope that auto-cancels after
+      [seconds]. If the deadline fires first, the operations [f] is awaiting are
+      cancelled and {!Canceled} is raised in [f], propagating out unless [f] catches
+      it. If [f] finishes first, the deadline timer is cancelled. *)
+
+  val detached : 'i ctx -> ('i ctx -> 'a) -> 'a
+  (** [detached ctx f] runs [f] in a detached child scope. Cancellation of an ancestor
+      scope does not reach a detached scope, so cleanup started under it (for example
+      a compensating activity after a cancel) runs to completion. *)
+
+  val is_cancel_requested : _ ctx -> bool
+  (** whether the current scope has been asked to cancel, for cooperative checks *)
 
   val on_signal : _ ctx -> 'a Signal.t -> ('a -> unit) -> unit
   (** [on_signal ctx signal handler] runs [handler] whenever [signal] is
@@ -234,6 +274,11 @@ module Workflow : sig
   (** [wait_condition ctx pred] blocks the workflow until [pred ()] holds,
       re-checked after each activation delivers new signals, timers, or activity
       results. *)
+
+  val wait_condition_timeout : _ ctx -> timeout:float -> (unit -> bool) -> bool
+  (** [wait_condition_timeout ctx ~timeout pred] blocks like {!wait_condition} but
+      gives up after [timeout] seconds. It returns [true] if [pred ()] held in time
+      and [false] if the timeout fired first. *)
 
   val continue_as_new : 'input ctx -> 'input -> 'a
   (** [continue_as_new ctx input] ends the current run and atomically starts a

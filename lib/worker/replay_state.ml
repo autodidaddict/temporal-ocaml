@@ -17,7 +17,10 @@
    so far — which [apply_job] appends to as activation jobs arrive. The replay engine
    ([Replay.run_workflow]) walks that log to drive the workflow body. *)
 
-type resolution = R_ok of Codec.payload | R_fail of string
+type resolution =
+  | R_ok of Codec.payload
+  | R_fail of string
+  | R_cancelled of string (* server resolved the op as cancelled; raises Canceled *)
 
 (* A child's first (start) resolution: it was created with this run id, or it
    could not be created. Its completion reuses [resolution] above. *)
@@ -42,6 +45,10 @@ type event =
        reject decision and the response are per-activation, not stored here. *)
   | Child_started of int * child_start (* seq, start outcome *)
   | Child_resolved of int * resolution (* seq, completion outcome *)
+  | Cancel_root of string
+    (* a CancelWorkflow job: cancel the root scope at this point in history. Ordered
+       like a signal, since where the body is parked when it arrives decides where
+       Canceled is raised. *)
 
 type run_state = {
   mutable wf_name : string;
@@ -84,7 +91,7 @@ let apply_job (state : run_state) = function
       | Coresdk.Completed p ->
         R_ok (match p with Some x -> x | None -> Codec.to_payload Codec.unit ())
       | Coresdk.Failed msg -> R_fail msg
-      | Coresdk.Cancelled msg -> R_fail ("cancelled: " ^ msg)
+      | Coresdk.Cancelled msg -> R_cancelled msg
       | Coresdk.Other_resolution -> R_fail "unknown activity resolution"
     in
     state.events_rev <- Activity_resolved (seq, r) :: state.events_rev
@@ -113,7 +120,7 @@ let apply_job (state : run_state) = function
       | Coresdk.Child_completed p ->
         R_ok (match p with Some x -> x | None -> Codec.to_payload Codec.unit ())
       | Coresdk.Child_failed msg -> R_fail msg
-      | Coresdk.Child_cancelled msg -> R_fail ("cancelled: " ^ msg)
+      | Coresdk.Child_cancelled msg -> R_cancelled msg
       | Coresdk.Child_result_other -> R_fail "unknown child result"
     in
     state.events_rev <- Child_resolved (seq, r) :: state.events_rev
@@ -124,4 +131,6 @@ let apply_job (state : run_state) = function
     let p = match input with p :: _ -> p | [] -> Codec.to_payload Codec.unit () in
     state.events_rev <-
       Update { protocol_instance_id; name; input = p } :: state.events_rev
-  | Coresdk.Cancel_workflow _ | Coresdk.Remove_from_cache | Coresdk.Other -> ()
+  | Coresdk.Cancel_workflow { reason } ->
+    state.events_rev <- Cancel_root reason :: state.events_rev
+  | Coresdk.Remove_from_cache | Coresdk.Other -> ()
