@@ -69,6 +69,9 @@ type wf_job =
     }
   | Resolve_child_workflow_execution of { seq : int; result : child_result }
   | Cancel_workflow of { reason : string }
+  | Notify_has_patch of { patch_id : string }
+      (* sdk-core saw this patch's marker in history. Sent before the body asks, so
+         [patched] can answer without blocking (ADR-0005). *)
   | Remove_from_cache
   | Other
 
@@ -77,6 +80,9 @@ type wf_activation = {
   jobs : wf_job list;
   continue_as_new_suggested : bool;
   history_length : int;
+  is_replaying : bool;
+      (* whether this activation is replaying recorded history. A patch check with no
+         marker answers from this (ADR-0005). *)
 }
 
 let decode_payloads_field r acc = Codec.decode_payload (Pb.Reader.bytes r) :: acc
@@ -329,10 +335,21 @@ let decode_cancel_workflow s =
   done;
   Cancel_workflow { reason = !reason }
 
+(* NotifyHasPatch { patch_id=1 (string) } *)
+let decode_notify_has_patch s =
+  let r = Pb.Reader.create s in
+  let patch_id = ref "" in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | 1, 2 -> patch_id := Pb.Reader.bytes r
+    | _, w -> Pb.Reader.skip r w
+  done;
+  Notify_has_patch { patch_id = !patch_id }
+
 (* WorkflowActivationJob { oneof { initialize_workflow=1; fire_timer=2;
    query_workflow=5; cancel_workflow=6; signal_workflow=7; resolve_activity=8;
-   resolve_child_workflow_execution_start=10; resolve_child_workflow_execution=11;
-   do_update=14; remove_from_cache=50 } } *)
+   notify_has_patch=9; resolve_child_workflow_execution_start=10;
+   resolve_child_workflow_execution=11; do_update=14; remove_from_cache=50 } } *)
 let decode_wf_job s =
   let r = Pb.Reader.create s in
   let job = ref Other in
@@ -344,6 +361,7 @@ let decode_wf_job s =
     | 6, 2 -> job := decode_cancel_workflow (Pb.Reader.bytes r)
     | 7, 2 -> job := decode_signal_workflow (Pb.Reader.bytes r)
     | 8, 2 -> job := decode_resolve_activity (Pb.Reader.bytes r)
+    | 9, 2 -> job := decode_notify_has_patch (Pb.Reader.bytes r)
     | 10, 2 -> job := decode_resolve_child_start (Pb.Reader.bytes r)
     | 11, 2 -> job := decode_resolve_child (Pb.Reader.bytes r)
     | 14, 2 -> job := decode_do_update (Pb.Reader.bytes r)
@@ -354,15 +372,17 @@ let decode_wf_job s =
   done;
   !job
 
-(* WorkflowActivation { run_id=1; history_length=4 (uint32); jobs=5 (repeated);
-   continue_as_new_suggested=8 (bool) } *)
+(* WorkflowActivation { run_id=1; is_replaying=3 (bool); history_length=4 (uint32);
+   jobs=5 (repeated); continue_as_new_suggested=8 (bool) } *)
 let decode_wf_activation s =
   let r = Pb.Reader.create s in
   let run_id = ref "" and jobs = ref [] in
   let history_length = ref 0 and can_suggested = ref false in
+  let is_replaying = ref false in
   while not (Pb.Reader.at_end r) do
     match Pb.Reader.key r with
     | 1, 2 -> run_id := Pb.Reader.bytes r
+    | 3, 0 -> is_replaying := Pb.Reader.varint r <> 0
     | 4, 0 -> history_length := Pb.Reader.varint r
     | 5, 2 -> jobs := decode_wf_job (Pb.Reader.bytes r) :: !jobs
     | 8, 0 -> can_suggested := Pb.Reader.varint r <> 0
@@ -372,6 +392,7 @@ let decode_wf_activation s =
     jobs = List.rev !jobs;
     continue_as_new_suggested = !can_suggested;
     history_length = !history_length;
+    is_replaying = !is_replaying;
   }
 
 (* ---- encode: WorkflowActivationCompletion ----------------------------- *)
@@ -422,6 +443,10 @@ type wf_command =
   | Cancel_child_workflow_execution of {
       child_workflow_seq : int; (* the StartChildWorkflowExecution seq *)
       reason : string;
+    }
+  | Set_patch_marker of {
+      patch_id : string; (* the identifier the body passed to [patched] *)
+      deprecated : bool; (* true once the unpatched branch is gone (ADR-0005) *)
     }
 
 (* google.protobuf.Duration { int64 seconds=1; int32 nanos=2 } *)
@@ -588,6 +613,18 @@ let encode_command = function
     let cmd = Pb.Writer.create () in
     Pb.Writer.bytes cmd 12 (Pb.Writer.contents cc);
     (* WorkflowCommand.cancel_child_workflow_execution = 12 *)
+    Pb.Writer.contents cmd
+  | Set_patch_marker { patch_id; deprecated } ->
+    (* SetPatchMarker { patch_id=1; deprecated=2 }. sdk-core turns this into a
+       server-side RecordMarker named "core_patch" and upserts the
+       TemporalChangeVersion search attribute, and it drops a marker for a patch id
+       it has already built a command for. *)
+    let sp = Pb.Writer.create () in
+    Pb.Writer.bytes sp 1 patch_id;
+    if deprecated then Pb.Writer.int sp 2 1;
+    let cmd = Pb.Writer.create () in
+    Pb.Writer.bytes cmd 10 (Pb.Writer.contents sp);
+    (* WorkflowCommand.set_patch_marker = 10 *)
     Pb.Writer.contents cmd
 
 (* WorkflowActivationCompletion { run_id=1; successful=2 = Success{ commands=1 } } *)

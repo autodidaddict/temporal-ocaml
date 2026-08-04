@@ -133,4 +133,8 @@ let apply_job (state : run_state) = function
       Update { protocol_instance_id; name; input = p } :: state.events_rev
   | Coresdk.Cancel_workflow { reason } ->
     state.events_rev <- Cancel_root reason :: state.events_rev
+  | Coresdk.Notify_has_patch _ ->
+    (* Phase 2 of the ADR-0005 plan records the answer here. The job carries no
+       ordering significance, unlike a signal, so it will not join the event log. *)
+    ()
   | Coresdk.Remove_from_cache | Coresdk.Other -> ()

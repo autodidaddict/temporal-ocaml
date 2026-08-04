@@ -153,6 +153,63 @@ let () =
      | Coresdk.Resolve_activity { seq = 5; result = Coresdk.Cancelled "act boom" } -> true
      | _ -> false)
 
+(* ---- wire: patching (ADR-0005 phase 0) ---------------------------------- *)
+
+(* value of [field] (a length-delimited string) in a message, or "" if absent *)
+let field_bytes field bytes =
+  let r = Pb.Reader.create bytes in
+  let v = ref "" in
+  while not (Pb.Reader.at_end r) do
+    match Pb.Reader.key r with
+    | f, 2 when f = field -> v := Pb.Reader.bytes r
+    | _, w -> Pb.Reader.skip r w
+  done;
+  !v
+
+let () =
+  let marker patch_id deprecated =
+    Coresdk.encode_command (Coresdk.Set_patch_marker { patch_id; deprecated })
+  in
+  let f, inner = top_field (marker "fast-charge" false) in
+  check "encode SetPatchMarker -> field 10, patch_id"
+    (f = 10 && field_bytes 1 inner = "fast-charge");
+  check "encode SetPatchMarker not deprecated -> field 2 omitted"
+    (field_varint 2 inner = -1);
+  let _, inner = top_field (marker "fast-charge" true) in
+  check "encode SetPatchMarker deprecated -> field 2 = 1" (field_varint 2 inner = 1)
+
+let () =
+  (* WorkflowActivationJob { notify_has_patch=9 { patch_id=1 } } *)
+  let nhp =
+    let w = Pb.Writer.create () in
+    Pb.Writer.bytes w 1 "fast-charge";
+    Pb.Writer.contents w
+  in
+  let job =
+    let w = Pb.Writer.create () in
+    Pb.Writer.bytes w 9 nhp;
+    Pb.Writer.contents w
+  in
+  check "decode NotifyHasPatch job"
+    (match Coresdk.decode_wf_job job with
+     | Coresdk.Notify_has_patch { patch_id = "fast-charge" } -> true
+     | _ -> false)
+
+let () =
+  (* WorkflowActivation { run_id=1; is_replaying=3 } *)
+  let activation_bytes ~replaying =
+    let w = Pb.Writer.create () in
+    Pb.Writer.bytes w 1 "run-1";
+    if replaying then Pb.Writer.int w 3 1;
+    Pb.Writer.contents w
+  in
+  check "decode WorkflowActivation is_replaying = true"
+    (Coresdk.decode_wf_activation (activation_bytes ~replaying:true)).Coresdk.is_replaying;
+  check "decode WorkflowActivation is_replaying defaults to false"
+    (not
+       (Coresdk.decode_wf_activation (activation_bytes ~replaying:false))
+          .Coresdk.is_replaying)
+
 (* ---- replay harness: characterization tests ----------------------------- *)
 
 (* an echo activity and a workflow that runs it once and returns the result *)

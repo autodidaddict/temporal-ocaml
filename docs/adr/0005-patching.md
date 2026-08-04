@@ -367,17 +367,23 @@ that decision in its own input instead.
 
 ## Open Questions
 
-- **Whether a `false` answer should still emit** - sdk-core builds a patch machine for
-  every `SetPatchMarker` it accepts, entering a replaying state when it is replaying and
-  the identifier was not seen while scanning history. Whether emitting in that case is
-  harmless or reports a command mismatch is unclear from reading
-  `patch_state_machine.rs`. The design above emits only on the answer-`true` path, which
-  is certainly correct. Confirm the other case before relying on either.
-- **Post-eviction replay and `is_replaying`** - The sticky-answer rule assumes a full
-  replay after eviction carries `is_replaying = true` for the whole body up to the
-  history tip. Confirm against sdk-core, and cover it in `replay_test.ml`, since the
-  rule is unsound if a from-scratch replay ever reports `is_replaying = false` before
-  reaching the tip.
+- **Whether a `false` answer should still emit** - _Answered by the phase 0 spike:
+  harmless._ sdk-core builds a patch machine for every `SetPatchMarker` it accepts,
+  entering a replaying state when it is replaying and the identifier was not seen while
+  scanning history, and reading `patch_state_machine.rs` did not settle whether that
+  reports a command mismatch. Emitting a marker from a body replaying against a history
+  with no marker recorded the marker once and the execution completed, with no workflow
+  task failure. The spike did not isolate the replaying emission from the non-replaying
+  ones that followed it in the same run, so it establishes that the case is not an
+  error rather than which emission recorded the marker. The design still emits only on
+  the answer-`true` path, and this removes the risk of being wrong about it.
+- **Post-eviction replay and `is_replaying`** - _Answered by the phase 0 spike:
+  confirmed._ Restarting a worker while an execution is parked, then waking it, gives
+  one activation with `is_replaying = true` carrying the replayed history followed by
+  activations with `is_replaying = false` carrying the new work. That is exactly the
+  sequence the recorded answer has to survive, and it confirms a from-scratch replay
+  does not report `is_replaying = false` before reaching the tip. Phase 3 covers the
+  same sequence in `replay_test.ml`.
 - **Where a `false` answer is memoized** - Holding it in `replay_state` ties it to the
   run's cache entry. Confirm that no activation sequence evicts the run and then
   delivers new work without an intervening replay of the body.

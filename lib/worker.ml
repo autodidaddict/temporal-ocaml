@@ -75,8 +75,10 @@ let workflow_loop (t : t) =
         && not
              (List.exists
                 (function
-                  | Coresdk.Query_workflow _ | Coresdk.Remove_from_cache
-                  | Coresdk.Other ->
+                  (* NotifyHasPatch answers a patch check rather than advancing the
+                     body, so it does not disqualify a read-only query replay. *)
+                  | Coresdk.Query_workflow _ | Coresdk.Notify_has_patch _
+                  | Coresdk.Remove_from_cache | Coresdk.Other ->
                     false
                   | _ -> true)
                 a.Coresdk.jobs)

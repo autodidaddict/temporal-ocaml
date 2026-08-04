@@ -39,18 +39,30 @@ truth; this plan is the intended sequence, and it will shift as phases land.
 
 ### Phase 0 - Wire plumbing and the sdk-core spikes
 
-No behavior change. Settles the two open questions the answer rule depends on.
+Landed. No behavior change. Settles the two open questions the answer rule depends on.
 
-- Add to `coresdk.ml`, encode and decode only, nothing emitted or consumed yet: decode
-  `NotifyHasPatch = 9` (field `patch_id = 1`) and `WorkflowActivation.is_replaying = 3`;
-  add an encoder for `SetPatchMarker = 10` (fields `patch_id = 1`,
-  `deprecated = 2`). Round-trip tests alongside the existing ones in `test_codec.ml`.
-- Spike via `livetest.sh`, driving a workflow whose body emits a marker: does a full
-  replay after an eviction carry `is_replaying = true` for the whole body up to the
-  history tip? This is what makes a recorded `false` answer safe to rebuild.
-- Spike the second question: emit `SetPatchMarker` from a body that is replaying with no
-  marker in history and observe whether sdk-core accepts it or reports a mismatch. The
-  answer decides whether the emit path needs a guard beyond the answer-`true` branch.
+- Added to `coresdk.ml`, encode and decode only, nothing emitted or consumed yet:
+  decode `NotifyHasPatch = 9` (field `patch_id = 1`) and
+  `WorkflowActivation.is_replaying = 3`; an encoder for `SetPatchMarker = 10` (fields
+  `patch_id = 1`, `deprecated = 2`).
+- Two consumers had to account for the new job variant. `apply_job` ignores it until
+  phase 2. `worker.ml` classifies it as non-mutating when deciding `query_mode`, since
+  it answers a patch check rather than advancing the body, and leaving it out would have
+  turned a query-only activation into a read-write replay.
+- The round-trip tests went into `replay_test.ml`, not `test_codec.ml` as this plan
+  first said. `test_codec.ml` exercises the public `Codec` API through `Temporal`, and
+  the wire layer is only reachable as `Temporal__Coresdk`, which `replay_test.ml`
+  already opens for the ADR-0004 encoders.
+- Both spikes ran against a dev server with a worker restarted mid-execution, using
+  `ApprovalWorkflow` because it parks on `wait_condition` and can be left open. Results
+  are recorded in the ADR's open questions. A from-scratch replay does carry
+  `is_replaying = true` for the replayed history and `false` for the new work that
+  follows, and emitting a marker while replaying against a history with no marker is
+  accepted rather than reported as a mismatch.
+- The spikes needed throwaway instrumentation in `worker.ml` and `replay.ml`, reverted
+  once they answered. Note for anyone repeating them: after killing a worker, the next
+  workflow task goes to the dead worker's sticky queue and only reaches a fresh worker
+  once that times out, which takes longer than an obvious wait.
 
 ### Phase 1 - Thread `is_replaying` through the runtime
 
@@ -110,11 +122,11 @@ with Phase 2.
 
 Each is resolved by the phase noted:
 
-- Whether a `false` answer should still emit `SetPatchMarker` (Phase 0 spike). Decides
-  whether Phase 2's emit path needs a guard beyond the answer-`true` branch.
-- Post-eviction replay and `is_replaying` (Phase 0 spike, confirmed again in Phase 3).
-  The recorded-answer rule is unsound if a from-scratch replay ever reports
-  `is_replaying = false` before reaching the history tip.
+- Whether a `false` answer should still emit `SetPatchMarker` (Phase 0). Answered:
+  harmless, so phase 2's emit path needs no guard beyond the answer-`true` branch.
+- Post-eviction replay and `is_replaying` (Phase 0, covered again in Phase 3).
+  Answered: a from-scratch replay reports `is_replaying = true` for the replayed
+  history, so the recorded-answer rule holds.
 - Where a `false` answer is memoized (Phase 2). Holding it in `run_state` ties it to the
   run's cache entry, which is only safe if no activation sequence evicts a run and then
   delivers new work without replaying the body first.
