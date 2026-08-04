@@ -319,6 +319,21 @@ let on_update (_ : _ ctx) (u : ('a, 'b) Update.t) ?(validate : ('a -> unit) opti
   Effect.perform
     (Register_update_handler_effect (u.Update.name, validator, handler))
 
+(* Patching (ADR-0005). [patched] reports whether this execution should take the
+   patched branch, so a body can carry old and new code at once and executions that
+   predate the patch keep the branch they started on. Both are synchronous: the
+   handler answers and resumes without parking the fiber, so an ordinary [if] in the
+   body is not a scheduling point. *)
+type _ Effect.t +=
+  | Patched_effect : string -> bool Effect.t
+  | Deprecate_patch_effect : string -> unit Effect.t
+
+let patched (_ : _ ctx) (patch_id : string) : bool =
+  Effect.perform (Patched_effect patch_id)
+
+let deprecate_patch (_ : _ ctx) (patch_id : string) : unit =
+  Effect.perform (Deprecate_patch_effect patch_id)
+
 (* registered form: builds the typed ctx (carrying the workflow's own input
    encoder) from the per-activation runtime info, then runs the body. *)
 type reg = {

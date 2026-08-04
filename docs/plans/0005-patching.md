@@ -24,10 +24,10 @@ truth; this plan is the intended sequence, and it will shift as phases land.
   `patches : (string, bool) Hashtbl.t` in `run_state` covers both, since a
   `NotifyHasPatch` job simply writes `true` before the body runs. The ADR text follows
   this shape.
-- **No new `issued` keys.** The answer table already means an identifier reaches the
-  emit path at most once per run, and sdk-core drops duplicate `SetPatchMarker` commands
-  through its own `encountered_patch_markers` table. Adding a `"patch:<id>"` key to the
-  ADR-0004 emit-once set would be redundant.
+- **No new `issued` keys, and no emit-once for markers at all.** The marker is emitted
+  on every run that takes the patched branch, because sdk-core treats a marker in
+  history with no matching command as a workflow that does not support that version.
+  sdk-core drops the duplicates through its own `encountered_patch_markers` table.
 - **`patched` is an effect.** `ctx` carries plain values rebuilt per activation and
   cannot reach `run_state`, which only `replay.ml` holds. The check follows every other
   workflow operation and performs an effect, with the handler continuing immediately
@@ -79,18 +79,32 @@ Landed. Behavior-preserving.
 
 ### Phase 2 - `patched` and `deprecate_patch`
 
-- `replay_state` gains `patches : (string, bool) Hashtbl.t`, rebuilt empty on eviction
-  like `issued`.
-- `apply_job` handles the `Notify_has_patch` job by writing `true` for its identifier.
-  The job carries no ordering significance, unlike a signal, so it does not join the
-  event log.
-- Two effects in `workflow.ml`, `Patched_effect of string -> bool` and
-  `Deprecate_patch_effect of string -> unit`, with handlers in `replay.ml` that consult
-  the table, fall back to `is_replaying`, record the answer, and continue immediately.
-- Marker emission goes through the existing `emit`, so `query_mode` suppresses it and a
-  read-only query replay adds nothing to history.
-- Public API in `temporal.mli` with the four-step lifecycle summarized in the docstring,
-  since that is where a developer will look for it.
+Landed.
+
+- `replay_state` gained `patches : (string, bool) Hashtbl.t`, rebuilt empty on eviction
+  like `issued`. `apply_job` writes `true` for a `Notify_has_patch` job. The job carries
+  no ordering significance, unlike a signal, so it does not join the event log.
+- Two effects in `workflow.ml`, `Patched_effect` and `Deprecate_patch_effect`, with
+  handlers in `replay.ml` that answer from the table, fall back to `is_replaying`,
+  record the answer, and continue immediately.
+- The recorded answer controls the answer alone. The marker is emitted on every run
+  that takes the patched branch, not only the run that first decided it. A marker in an
+  execution's history with no matching command from us is what sdk-core reports as a
+  workflow that does not support this version, so suppressing the command on later
+  re-runs would have been a live break. sdk-core drops the duplicates through its own
+  `encountered_patch_markers` table, which the phase 0 spike observed directly.
+- Markers ride in a list of their own rather than through `emit`. A terminal command
+  replaces `commands` outright, so a body that records a marker and then completes in
+  the same activation would otherwise lose it. Making the terminal command cons onto the
+  list instead was tried first and broke eight cancellation tests: discarding pending
+  operation commands when a run closes is deliberate. Keeping markers separate also
+  fixes their position, so they lead the completion on the recording run and on every
+  replay after it. `query_mode` still suppresses them.
+- Public API in `temporal.mli`, with the retirement steps in the docstring since that is
+  where a developer will look for them.
+- Four tests cover the mechanism: a first pass, a replay with no marker, a
+  `NotifyHasPatch` answering true while replaying, and `deprecate_patch`. Phase 3 covers
+  the sequences.
 
 ### Phase 3 - Replay tests for the sticky answer
 

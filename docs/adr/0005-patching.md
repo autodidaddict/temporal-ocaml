@@ -311,9 +311,13 @@ The answer is a function of history in every case. `NotifyHasPatch` arrives as a
 ordinary activation job in history order, and the recorded answer makes every later
 evaluation in the run agree with the first. Marker commands are emitted in fiber order
 like every other command, so their position in the command sequence replays
-identically. Emit-once needs no set of its own here, since the recorded answer means an
-identifier reaches the emit path at most once per run, and sdk-core drops a duplicate
-in any case.
+identically.
+
+The recorded answer governs the answer alone. The marker is emitted on every run that
+takes the patched branch, since a marker in an execution's history with no matching
+command from the runtime is what sdk-core reports as a workflow that does not support
+this version. sdk-core drops the duplicates through its own `encountered_patch_markers`
+table, so no emit-once set is needed here.
 
 A read-only query replay suppresses the marker command through the existing
 `query_mode` check in `emit`. Answering a query must not add to an execution's history.
