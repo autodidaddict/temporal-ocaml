@@ -224,10 +224,11 @@ let echo_wf =
 let init_job ~workflow_type ~workflow_id args =
   Coresdk.Initialize_workflow { workflow_type; workflow_id; arguments = args }
 
-(* run one activation of [reg] against the accumulated [state] *)
-let activation reg state ~run_id ~history_length =
+(* run one activation of [reg] against the accumulated [state]. [is_replaying]
+   defaults to false, matching an activation that carries new work. *)
+let activation ?(is_replaying = false) reg state ~run_id ~history_length =
   Replay.run_workflow reg state ~task_queue:"test-tq" ~run_id ~can_suggested:false
-    ~history_length ~query_mode:false ~queries:[] ~updates:[]
+    ~history_length ~is_replaying ~query_mode:false ~queries:[] ~updates:[]
 
 let () =
   let run_id = "wf-echo" in
@@ -352,7 +353,7 @@ let () =
   let _ = activation wf st ~run_id ~history_length:1 in
   let c =
     Replay.run_workflow wf st ~task_queue:"test-tq" ~run_id ~can_suggested:false
-      ~history_length:1 ~query_mode:true ~queries:[ ("q1", "status", []) ] ~updates:[]
+      ~history_length:1 ~is_replaying:false ~query_mode:true ~queries:[ ("q1", "status", []) ] ~updates:[]
   in
   check "query: answers pending with no advancing commands"
     (match c with
@@ -387,7 +388,7 @@ let () =
          run_validator = true });
   let c1 =
     Replay.run_workflow wf st ~task_queue:"test-tq" ~run_id ~can_suggested:false
-      ~history_length:2 ~query_mode:false ~queries:[] ~updates:[ ("u1", true) ]
+      ~history_length:2 ~is_replaying:false ~query_mode:false ~queries:[] ~updates:[ ("u1", true) ]
   in
   check "update: accepted then completed with new balance"
     (match c1 with
@@ -401,7 +402,7 @@ let () =
          run_validator = true });
   let c2 =
     Replay.run_workflow wf st ~task_queue:"test-tq" ~run_id ~can_suggested:false
-      ~history_length:3 ~query_mode:false ~queries:[] ~updates:[ ("u2", true) ]
+      ~history_length:3 ~is_replaying:false ~query_mode:false ~queries:[] ~updates:[ ("u2", true) ]
   in
   check "update: validator rejects a non-positive deposit"
     (match c2 with

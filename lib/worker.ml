@@ -108,7 +108,8 @@ let workflow_loop (t : t) =
             Replay.run_workflow wf state ~task_queue:t.task_queue
               ~run_id:a.Coresdk.run_id
               ~can_suggested:a.Coresdk.continue_as_new_suggested
-              ~history_length:a.Coresdk.history_length ~query_mode ~queries ~updates
+              ~history_length:a.Coresdk.history_length
+              ~is_replaying:a.Coresdk.is_replaying ~query_mode ~queries ~updates
           | None ->
             Eio.traceln "[wf] no workflow registered as %S" state.wf_name;
             []

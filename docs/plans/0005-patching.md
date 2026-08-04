@@ -66,12 +66,15 @@ Landed. No behavior change. Settles the two open questions the answer rule depen
 
 ### Phase 1 - Thread `is_replaying` through the runtime
 
-Behavior-preserving.
+Landed. Behavior-preserving.
 
-- `decode_wf_activation` returns `is_replaying`, and `workflow_loop` passes it into
-  `Replay.run_workflow` the way it already passes `can_suggested` and `history_length`.
-- Existing characterization tests must pass unchanged. Nothing reads the new argument
-  yet.
+- `workflow_loop` passes the decoded `is_replaying` into `Replay.run_workflow` the way
+  it already passes `can_suggested` and `history_length`.
+- `run_workflow` takes it as `~is_replaying:_`, so the label is in the signature for
+  phase 2 without tripping the unused-variable warning.
+- The `activation` helper in `replay_test.ml` takes `?(is_replaying = false)`, which
+  leaves every existing test unchanged and gives phase 3 the `true` case it needs. The
+  same test count passes before and after, which is the point of the phase.
 - Useful past this ADR. Replay-aware logging needs the same field.
 
 ### Phase 2 - `patched` and `deprecate_patch`

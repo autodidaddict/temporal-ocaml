@@ -45,9 +45,12 @@ type cancel_spec = {
    command. Queries are answered, and updates validated/run and responded to, from the
    handlers the body registers. [task_queue] is the worker's default queue, used for
    scheduled activities and as the fallback for child workflows that don't name one. *)
+(* [is_replaying] is this activation's WorkflowActivation.is_replaying. Phase 2 of the
+   ADR-0005 plan reads it to answer a patch check that has no marker in history;
+   nothing reads it yet. *)
 let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
-    ~run_id ~can_suggested ~history_length ~query_mode ~queries ~updates :
-    Coresdk.wf_command list =
+    ~run_id ~can_suggested ~history_length ~is_replaying:_ ~query_mode ~queries
+    ~updates : Coresdk.wf_command list =
   let commands = ref [] in
   (* a query replay is read-only: it rebuilds state from history but must emit no
      workflow-advancing command. [emit] centralizes that guard for the incremental
