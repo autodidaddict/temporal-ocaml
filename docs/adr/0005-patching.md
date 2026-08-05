@@ -408,9 +408,18 @@ question was settled as follows.
 - **Reporting a stale patch** - Still deferred. Whether the SDK should record which
   patch identifiers a body checked, so a worker can report patches that no live
   execution needs any more, depends on the metrics work the SDK also lacks.
-- **Continue-as-new** - The behavior described above is drawn from the other SDKs and
-  from markers being per-run, and no test covers it. Worth one if a looping workflow
-  ever depends on it.
+- **Continue-as-new** - Confirmed by scenario 16 of `livetest.sh`. An execution started
+  before the patch answers `false`, continues-as-new under the patched deployment, and
+  the run after the boundary records its own marker and takes the patched branch while
+  the run before it recorded none. Nothing had to be built for this: the answers live in
+  `run_state` keyed by run id, so a new run starts with an empty table. A replay-harness
+  test would have been close to tautological for the same reason, which is why the
+  coverage is at the server level.
+- **The deprecated-marker row** - Covered by scenario 15, the counterpart to 14. An
+  execution carrying a deprecated marker survives having the check deleted, where one
+  carrying a plain marker does not. That pair is what makes retiring a patch two
+  deployments rather than one, and it was the last row of the semantics table with
+  nothing asserting it.
 
 ## References
 

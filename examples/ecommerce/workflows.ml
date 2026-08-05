@@ -241,3 +241,21 @@ let patch_demo_retired =
   sleep ctx 1.0;
   wait_for_proceed ctx;
   "patched"
+
+(* Patch markers live in a run's history, and continue-as-new starts a run with an
+   empty one, so an execution that answered one way before the boundary can answer the
+   other way after it. Two versions again, before and after the change, registered by
+   the same PATCH_DEMO switch. livetest.sh starts this under the pre-patch version and
+   lets it continue-as-new under the patched one. *)
+let patch_continue_before =
+  Workflow.define ~name:"PatchContinueWorkflow" ~input:Codec.int ~output:Codec.string
+  @@ fun ctx (n : int) ->
+  wait_for_proceed ctx;
+  if n > 0 then continue_as_new ctx (n - 1) else "original"
+
+let patch_continue_patched =
+  Workflow.define ~name:"PatchContinueWorkflow" ~input:Codec.int ~output:Codec.string
+  @@ fun ctx (n : int) ->
+  let branch = if patched ctx "continue-change" then "patched" else "original" in
+  wait_for_proceed ctx;
+  if n > 0 then continue_as_new ctx (n - 1) else branch

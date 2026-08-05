@@ -160,6 +160,26 @@ Landed. The ADR is Accepted.
   proved nothing.
 - All 14 livetest scenarios pass, and `dune test` is at 101 checks.
 
+Two follow-ups landed after the ADR was accepted, closing the last two gaps in its
+coverage.
+
+- Scenario 15 asserts the deprecated-marker row, the counterpart to 14: an execution
+  carrying a deprecated marker survives having the check deleted, where one carrying a
+  plain marker does not. It was the last row of the semantics table with nothing
+  asserting it, and it had only been observed by accident when scenario 14 was first
+  written wrong.
+- Scenario 16 covers continue-as-new, with a second pair of before and after versions
+  in the example. Nothing had to be built: the answers live in `run_state` keyed by run
+  id, so a new run starts with an empty table. The coverage is at the server level
+  because a replay-harness test would have been close to tautological for that same
+  reason.
+- One timing trap worth recording: run 2 of a continue-as-new needs its own signal, and
+  it has to exist before the signal is sent. The first signal waits out the restarted
+  worker's sticky-queue timeout before run 1 even sees it, so sending the second on a
+  fixed delay lands it on run 1, where it is lost at the boundary. `await_new_run` polls
+  for the run id to change instead.
+- 16 livetest scenarios pass.
+
 ## Open questions carried from the ADR
 
 Each is resolved by the phase noted:

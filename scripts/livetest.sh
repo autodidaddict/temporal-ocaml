@@ -168,6 +168,36 @@ names = {e["activityTaskScheduledEventAttributes"]["activityType"]["name"]
 print("yes" if sys.argv[1] in names else "no")
 ' "$2" 2>/dev/null
 }
+current_run() { # id -> the run id currently serving this workflow id
+  temporal workflow describe --workflow-id "$1" --output json 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin).get("workflowExecutionInfo", {})
+print(d.get("execution", {}).get("runId", ""))
+' 2>/dev/null
+}
+await_new_run() { # id old-run-id: wait until continue-as-new has produced a new run
+  for _ in $(seq 1 40); do
+    r="$(current_run "$1")"
+    [ -n "$r" ] && [ "$r" != "$2" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+start_wf_run() { # id type input -> the run id of the execution just started
+  temporal workflow start --task-queue "$task_queue" --type "$2" \
+    --workflow-id "$1" --input "$3" --output json 2>/dev/null \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("runId",""))' 2>/dev/null
+}
+has_events_run() { # id run-id type-substring... -> yes|no, against one run's history
+  local id="$1" rid="$2"; shift 2
+  temporal workflow show --workflow-id "$id" --run-id "$rid" --output json 2>/dev/null | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+types = {e["eventType"] for e in d["events"]}
+want = sys.argv[1:]
+print("yes" if all(any(w in t for t in types) for w in want) else "no")
+' "$@" 2>/dev/null
+}
 await_history() { # id type-substring: poll until an event of this type appears
   for _ in $(seq 1 30); do
     case "$(has_events "$1" "$2")" in yes) return 0 ;; *) sleep 1 ;; esac
@@ -438,6 +468,63 @@ if await_running patch-ret; then
   esac
 else
   fail "patch-ret never started"
+fi
+
+# ---- scenario 15: a deprecated marker survives the deletion --------------------
+log "scenario 15: deprecate_patch is what makes deleting the check safe"
+# The counterpart to scenario 14. There the execution carried a plain marker and the
+# deleted check wedged it. Here it carries a deprecated one, which sdk-core ignores
+# once the body stops asking, so the same deletion is survivable. This is the whole
+# reason retiring a patch takes two deployments rather than one.
+restart_worker deprecated || fail "worker did not restart on the deprecated version"
+start_wf patch-dep-ret PatchDemoWorkflow 'null'
+if await_running patch-dep-ret; then
+  restart_worker retired || fail "worker did not restart on the retired version"
+  signal_proceed patch-dep-ret
+  st="$(await_terminal patch-dep-ret)"
+  case "$st" in
+    *COMPLETED) pass "deprecated marker tolerated once the check is deleted" ;;
+    *) fail "patch-dep-ret status: $st" ;;
+  esac
+else
+  fail "patch-dep-ret never started"
+fi
+
+# ---- scenario 16: continue-as-new starts a run with no markers -----------------
+log "scenario 16: the answer may flip at a continue-as-new boundary"
+# Markers live in a run's history and continue-as-new starts a run with an empty one,
+# so an execution that answered one way before the boundary answers the other way
+# after it. The first run also exercises the recorded answer end to end: it replays
+# under the patched worker and has to keep answering false.
+restart_worker before || fail "worker did not restart on the pre-patch version"
+can_run1="$(start_wf_run patch-can PatchContinueWorkflow '1')"
+if [ -n "$can_run1" ] && await_running patch-can; then
+  restart_worker patched || fail "worker did not restart on the patched version"
+  signal_proceed patch-can            # run 1 continues-as-new into run 2
+  # Run 2 needs a proceed signal of its own, and it has to exist first: signal 1 waits
+  # out the restarted worker's sticky-queue timeout before run 1 even sees it, so
+  # sending signal 2 on a timer lands it on run 1 and it is lost at the boundary.
+  if await_new_run patch-can "$can_run1"; then
+    signal_proceed patch-can          # run 2 proceeds to completion
+    st="$(await_terminal patch-can)"
+    case "$st" in *COMPLETED) pass "continue-as-new chain COMPLETED" ;; *) fail "patch-can status: $st" ;; esac
+    case "$(result patch-can)" in
+      *patched*) pass "the run after the boundary took the patched branch" ;;
+      *) fail "patch-can result: $(result patch-can)" ;;
+    esac
+    case "$(has_events_run patch-can "$can_run1" MARKER_RECORDED)" in
+      no) pass "the run before the boundary recorded no marker" ;;
+      *)  fail "unexpected marker in the pre-boundary run" ;;
+    esac
+    case "$(has_events patch-can MARKER_RECORDED)" in
+      yes) pass "the run after the boundary recorded its own marker" ;;
+      *)   fail "no marker in the post-boundary run" ;;
+    esac
+  else
+    fail "continue-as-new never produced a second run"
+  fi
+else
+  fail "patch-can never started"
 fi
 
 # ---- summary ------------------------------------------------------------------
