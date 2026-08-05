@@ -1,6 +1,6 @@
 # 5. Patching
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-04
 
 ## Context
@@ -369,31 +369,48 @@ that decision in its own input instead.
   check is synchronous in every SDK, and blocking would make an ordinary `if` in the
   body a scheduling point.
 
-## Open Questions
+## Resolutions
 
-- **Whether a `false` answer should still emit** - _Answered by the phase 0 spike:
-  harmless._ sdk-core builds a patch machine for every `SetPatchMarker` it accepts,
-  entering a replaying state when it is replaying and the identifier was not seen while
-  scanning history, and reading `patch_state_machine.rs` did not settle whether that
-  reports a command mismatch. Emitting a marker from a body replaying against a history
-  with no marker recorded the marker once and the execution completed, with no workflow
-  task failure. The spike did not isolate the replaying emission from the non-replaying
-  ones that followed it in the same run, so it establishes that the case is not an
-  error rather than which emission recorded the marker. The design still emits only on
-  the answer-`true` path, and this removes the risk of being wrong about it.
-- **Post-eviction replay and `is_replaying`** - _Answered by the phase 0 spike:
-  confirmed._ Restarting a worker while an execution is parked, then waking it, gives
-  one activation with `is_replaying = true` carrying the replayed history followed by
-  activations with `is_replaying = false` carrying the new work. That is exactly the
-  sequence the recorded answer has to survive, and it confirms a from-scratch replay
-  does not report `is_replaying = false` before reaching the tip. Phase 3 covers the
-  same sequence in `replay_test.ml`.
-- **Where a `false` answer is memoized** - Holding it in `replay_state` ties it to the
-  run's cache entry. Confirm that no activation sequence evicts the run and then
-  delivers new work without an intervening replay of the body.
-- **Reporting a stale patch** - Whether the SDK should record which patch identifiers a
-  body checked, so a worker can report patches that no live execution needs any more.
-  Deferred, and it depends on the metrics work the SDK also lacks.
+The design landed across phases 0 through 4; `main` is the source of truth. Each open
+question was settled as follows.
+
+- **Post-eviction replay and `is_replaying`** - Confirmed by the phase 0 spike.
+  Restarting a worker while an execution is parked, then waking it, gives one
+  activation with `is_replaying = true` carrying the replayed history followed by
+  activations with `is_replaying = false` carrying the new work. That is the sequence
+  the recorded answer has to survive, and a from-scratch replay does not report
+  `is_replaying = false` before reaching the tip. Phase 3 covers the same sequence in
+  `replay_test.ml`.
+- **Whether a `false` answer should still emit** - Harmless, per the phase 0 spike.
+  Emitting a marker from a body replaying against a history with no marker recorded the
+  marker once and the execution completed, with no workflow task failure. The spike did
+  not isolate the replaying emission from the non-replaying ones that followed it in
+  the same run, so it establishes that the case is not an error rather than which
+  emission recorded the marker. The runtime emits only on the answer-`true` path
+  regardless.
+- **Emitting on every run, not only the first** - The recorded answer governs the
+  answer alone. Suppressing the marker on later re-runs was written into the first
+  draft of this ADR and is wrong: a marker in an execution's history with no matching
+  command is what sdk-core reports as a workflow that does not support this version.
+  Scenario 14 of `livetest.sh` demonstrates it directly. An execution carrying a plain
+  marker, replayed against a body with the check deleted, stops making progress and the
+  server records a workflow task failure. The body it is replayed against differs only
+  in that the check is gone, so the missing command is the whole cause. The same
+  execution replayed against a body using `deprecate_patch` completes, which is what
+  makes retiring a patch a two-deployment job.
+- **Where a `false` answer is memoized** - `run_state`, alongside `issued`, and
+  rebuilt empty on eviction. Phase 3 covers the eviction boundary.
+- **Marker position in the completion** - Markers ride in a list of their own rather
+  than through the general `emit`, because a terminal command replaces the command list
+  outright and would otherwise discard a marker recorded by a body that completes in the
+  same activation. That also fixes their position: markers lead the completion on the
+  run that records them and on every replay after it.
+- **Reporting a stale patch** - Still deferred. Whether the SDK should record which
+  patch identifiers a body checked, so a worker can report patches that no live
+  execution needs any more, depends on the metrics work the SDK also lacks.
+- **Continue-as-new** - The behavior described above is drawn from the other SDKs and
+  from markers being per-run, and no test covers it. Worth one if a looping workflow
+  ever depends on it.
 
 ## References
 

@@ -61,5 +61,13 @@ let () =
     |> register_workflow bulk_pack_workflow
     |> register_workflow saga_checkout_workflow
     |> register_workflow race_workflow
+    (* exactly one version of PatchDemoWorkflow, standing in for one deployment of
+       the same workflow. See workflows.ml and ADR-0005. *)
+    |> register_workflow
+         (match env_or "PATCH_DEMO" "patched" with
+          | "before" -> patch_demo_before
+          | "deprecated" -> patch_demo_deprecated
+          | "retired" -> patch_demo_retired
+          | _ -> patch_demo_patched)
   in
   Worker.run worker

@@ -135,14 +135,30 @@ answer can be observed across more than one activation.
 
 ### Phase 4 - Integration and finalize
 
-- Drive the ADR's developer flow against a dev server through `livetest.sh`: start
-  executions under an unpatched body, deploy a patched body against the same task queue,
-  and assert that the older executions complete on the original branch while new ones
-  take the patched one.
-- Add a patched workflow to `examples/ecommerce`, with the retired form in a comment so
-  the four-step lifecycle is visible in code.
-- Fold the spike results into the ADR, resolve the open questions, and flip it to
-  Accepted.
+Landed. The ADR is Accepted.
+
+- `examples/ecommerce` carries `PatchDemoWorkflow` in the four states its code passes
+  through: before the change, patched, deprecated, retired. `main.ml` registers exactly
+  one, chosen by `PATCH_DEMO`, so restarting the worker on a different version against
+  the same task queue is a deployment. This turned out better than the commented-out
+  retirement form this plan first described, because the lifecycle becomes executable
+  rather than illustrative.
+- `livetest.sh` gained `start_worker` and `restart_worker`, and two scenarios. Scenario
+  13 runs a pre-patch and a post-patch execution side by side under the patched worker
+  and asserts each keeps its own branch, its own marker presence, and in the pre-patch
+  case that the inserted timer never ran. Scenario 14 retires the patch: an execution
+  carrying a plain marker completes against a `deprecate_patch` body and stops making
+  progress against a body with the check deleted, with a workflow task failure recorded.
+- Scenario 14 is what settles the phase 2 emit rule. Until it ran, the claim that a
+  marker in history with no matching command breaks an execution was read off sdk-core's
+  source rather than observed. The retired body differs from the deprecated one only in
+  that the check is gone, so the missing command is the whole cause.
+- One test-design error worth recording: the retired-body execution has to be started
+  under the patched version. Started under the deprecated version it records a
+  deprecated marker, which sdk-core ignores once the body stops asking, and the
+  execution survives deletion. The first run of the scenario passed for that reason and
+  proved nothing.
+- All 14 livetest scenarios pass, and `dune test` is at 101 checks.
 
 ## Open questions carried from the ADR
 

@@ -57,12 +57,32 @@ SRV=$!
 for _ in $(seq 1 60); do temporal operator namespace list >/dev/null 2>&1 && break; sleep 1; done
 temporal operator namespace list >/dev/null 2>&1 || { echo "server never became ready"; cat "$tmp/server.log"; exit 2; }
 
+> "$tmp/worker.log"
+# Start the worker on one version of PatchDemoWorkflow (scenario 13 restarts it on
+# others; every other scenario is unaffected by the choice). All runs append to the
+# same log.
+start_worker() { # patch-demo version
+  PATCH_DEMO="${1:-patched}" TEMPORAL_TARGET="http://localhost:$port" \
+    TEMPORAL_TASK_QUEUE="$task_queue" "$worker" >>"$tmp/worker.log" 2>&1 &
+  WK=$!
+  for _ in $(seq 1 30); do
+    grep -q "worker polling" "$tmp/worker.log" && return 0
+    sleep 1
+  done
+  return 1
+}
+# A killed worker leaves its sticky queue behind, and the server only falls back to
+# the shared queue once that times out, so a restart takes longer to pick work up
+# than the worker takes to boot.
+restart_worker() { # patch-demo version
+  kill "$WK" 2>/dev/null
+  wait "$WK" 2>/dev/null
+  : > "$tmp/worker.log"
+  start_worker "$1"
+}
+
 log "starting worker"
-TEMPORAL_TARGET="http://localhost:$port" TEMPORAL_TASK_QUEUE="$task_queue" \
-  "$worker" >"$tmp/worker.log" 2>&1 &
-WK=$!
-for _ in $(seq 1 30); do grep -q "worker polling" "$tmp/worker.log" && break; sleep 1; done
-grep -q "worker polling" "$tmp/worker.log" || { echo "worker never started polling"; cat "$tmp/worker.log"; exit 2; }
+start_worker patched || { echo "worker never started polling"; cat "$tmp/worker.log"; exit 2; }
 
 # ---- helpers ------------------------------------------------------------------
 start_wf() { # id type input
@@ -328,6 +348,96 @@ if await_history smoke-race TIMER_STARTED; then
   esac
 else
   fail "race workflow never started its timers"
+fi
+
+# ---- scenario 13: patching across deployments (ADR-0005) ----------------------
+log "scenario 13: patch a workflow that has an execution in flight"
+# Each restart is a deployment of the same workflow type. An execution started before
+# the patch and one started after it run side by side under the patched worker, and
+# each has to keep the branch it started on.
+signal_proceed() { temporal workflow signal --workflow-id "$1" --name proceed --input 'null' >/dev/null 2>&1; }
+await_running() { # id: wait until the execution is open and parked
+  for _ in $(seq 1 30); do
+    case "$(status "$1")" in *RUNNING) return 0 ;; *) sleep 1 ;; esac
+  done
+  return 1
+}
+
+restart_worker before || fail "worker did not restart on the pre-patch version"
+start_wf patch-old PatchDemoWorkflow 'null'
+if await_running patch-old; then
+  # deploy the patched code while patch-old is parked, then start a second execution
+  # under it
+  restart_worker patched || fail "worker did not restart on the patched version"
+  start_wf patch-new PatchDemoWorkflow 'null'
+  await_running patch-new || fail "patch-new never started"
+
+  signal_proceed patch-new
+  st="$(await_terminal patch-new)"
+  case "$st" in *COMPLETED) pass "post-patch execution COMPLETED" ;; *) fail "patch-new status: $st" ;; esac
+  case "$(result patch-new)" in
+    *patched*) pass "post-patch execution took the patched branch" ;;
+    *) fail "patch-new result: $(result patch-new)" ;;
+  esac
+  case "$(has_events patch-new MARKER_RECORDED)" in
+    yes) pass "post-patch execution recorded a patch marker" ;;
+    *)   fail "no marker in patch-new history" ;;
+  esac
+
+  signal_proceed patch-old
+  st="$(await_terminal patch-old)"
+  case "$st" in *COMPLETED) pass "pre-patch execution COMPLETED under the patched worker" ;; *) fail "patch-old status: $st" ;; esac
+  case "$(result patch-old)" in
+    *original*) pass "pre-patch execution kept the original branch" ;;
+    *) fail "patch-old result: $(result patch-old)" ;;
+  esac
+  case "$(has_events patch-old MARKER_RECORDED)" in
+    no) pass "pre-patch execution recorded no marker" ;;
+    *)  fail "unexpected marker in patch-old history" ;;
+  esac
+  case "$(has_events patch-old TIMER_STARTED)" in
+    no) pass "pre-patch execution never ran the inserted timer" ;;
+    *)  fail "pre-patch execution ran the patched branch's timer" ;;
+  esac
+else
+  fail "pre-patch execution never started"
+fi
+
+# ---- scenario 14: retiring the patch ------------------------------------------
+log "scenario 14: deprecate then delete"
+# An execution whose history holds a marker survives the deprecated deployment and is
+# broken by the deleted one. This is why retiring a patch takes two deployments.
+start_wf patch-dep PatchDemoWorkflow 'null'
+if await_running patch-dep; then
+  restart_worker deprecated || fail "worker did not restart on the deprecated version"
+  signal_proceed patch-dep
+  st="$(await_terminal patch-dep)"
+  case "$st" in *COMPLETED) pass "marker-carrying execution COMPLETED under deprecate_patch" ;; *) fail "patch-dep status: $st" ;; esac
+else
+  fail "patch-dep never started"
+fi
+
+# This execution has to start under the patched version so its marker is a plain one.
+# Starting it under the deprecated version instead records a deprecated marker, which
+# sdk-core ignores when the body stops asking, and the execution would survive step 4.
+restart_worker patched || fail "worker did not restart on the patched version"
+start_wf patch-ret PatchDemoWorkflow 'null'
+if await_running patch-ret; then
+  # the retired body differs from the deprecated one only in that the check is gone,
+  # so a failure here is the missing marker command and nothing else
+  restart_worker retired || fail "worker did not restart on the retired version"
+  signal_proceed patch-ret
+  st="$(await_terminal patch-ret)"
+  case "$st" in
+    *RUNNING|TIMEOUT|"") pass "deleting the check too early wedges the execution (never completes)" ;;
+    *) fail "expected patch-ret to stall, got: $st" ;;
+  esac
+  case "$(has_events patch-ret WORKFLOW_TASK_FAILED)" in
+    yes) pass "server recorded a workflow task failure for the missing check" ;;
+    *)   fail "no task failure recorded for patch-ret" ;;
+  esac
+else
+  fail "patch-ret never started"
 fi
 
 # ---- summary ------------------------------------------------------------------
