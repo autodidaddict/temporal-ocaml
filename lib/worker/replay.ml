@@ -45,14 +45,24 @@ type cancel_spec = {
    command. Queries are answered, and updates validated/run and responded to, from the
    handlers the body registers. [task_queue] is the worker's default queue, used for
    scheduled activities and as the fallback for child workflows that don't name one. *)
+(* [is_replaying] is this activation's WorkflowActivation.is_replaying. A patch check
+   with no marker in history answers from it (ADR-0005). *)
 let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
-    ~run_id ~can_suggested ~history_length ~query_mode ~queries ~updates :
-    Coresdk.wf_command list =
+    ~run_id ~can_suggested ~history_length ~is_replaying ~query_mode ~queries
+    ~updates : Coresdk.wf_command list =
   let commands = ref [] in
   (* a query replay is read-only: it rebuilds state from history but must emit no
      workflow-advancing command. [emit] centralizes that guard for the incremental
      commands; the terminal ones (complete/fail/continue-as-new) guard inline. *)
   let emit cmd = if not query_mode then commands := cmd :: !commands in
+  (* Patch markers ride in their own list (ADR-0005). A terminal command replaces
+     [commands] outright, which is deliberate for operations, so a body that records a
+     marker and then completes in the same activation would otherwise lose it. Keeping
+     them separate also fixes their position: markers lead the completion on the run
+     that records them and on every replay after, so the order core matches against
+     history is the same every time. *)
+  let patch_commands = ref [] in
+  let emit_patch cmd = if not query_mode then patch_commands := cmd :: !patch_commands in
   let act_seq = ref 0 and timer_seq = ref 0 and child_seq = ref 0 in
   (* Signals: handlers the body registers (rebuilt each re-run), plus a per-name
      buffer for signals the log walk passed before a handler existed. Matches Temporal,
@@ -667,6 +677,38 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
             Some (fun (k : (a, unit) continuation) -> do_cancel sc; continue k ())
           | Workflow.Cancel_requested_effect sc ->
             Some (fun (k : (a, unit) continuation) -> continue k (is_cancelled sc))
+          | Workflow.Patched_effect patch_id ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                (* An answer recorded earlier in this run wins, so the body gives the
+                   same answer on every re-run. Otherwise a replaying activation means
+                   the execution predates the patch, and anything else is the first
+                   pass over new code. *)
+                let answer =
+                  match Hashtbl.find_opt state.patches patch_id with
+                  | Some a -> a
+                  | None ->
+                    let a = not is_replaying in
+                    Hashtbl.replace state.patches patch_id a;
+                    a
+                in
+                (* Emit on every run that takes the patched branch, not only the run
+                   that first decided it. A marker in an execution's history with no
+                   matching command from us is what sdk-core reports as a workflow
+                   that does not support this version, so recording the answer must
+                   not suppress the command. sdk-core drops the duplicates through
+                   its own encountered_patch_markers table. *)
+                if answer then
+                  emit_patch (Coresdk.Set_patch_marker { patch_id; deprecated = false });
+                continue k answer)
+          | Workflow.Deprecate_patch_effect patch_id ->
+            Some
+              (fun (k : (a, unit) continuation) ->
+                (* sdk-core allows the call in every history state, so there is no
+                   answer to record. Emitted on every run, for the same reason as the
+                   patched branch above. *)
+                emit_patch (Coresdk.Set_patch_marker { patch_id; deprecated = true });
+                continue k ())
           | Workflow.Continue_as_new_effect new_arg ->
             Some
               (fun (_ : (a, unit) continuation) ->
@@ -754,4 +796,4 @@ let run_workflow (wf : Workflow.reg) (state : run_state) ~task_queue:default_tq
   let query_commands = Queries.responses () in
   let update_commands = Updates.responses () in
   Updates.drop_rejected_events ();
-  List.rev !commands @ query_commands @ update_commands
+  List.rev !patch_commands @ List.rev !commands @ query_commands @ update_commands

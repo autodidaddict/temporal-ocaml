@@ -246,6 +246,34 @@ module Workflow : sig
   val is_cancel_requested : _ ctx -> bool
   (** whether the current scope has been asked to cancel, for cooperative checks *)
 
+  val patched : _ ctx -> string -> bool
+  (** [patched ctx patch_id] reports whether this execution should take the patched
+      branch of a change, so a body can carry the old and new code at once while
+      executions started before the change keep taking the old branch for the rest of
+      their lives. It returns immediately and never blocks.
+
+      Changing a workflow that has executions in flight otherwise breaks them: the
+      body is re-run and its commands matched against recorded history, and edited
+      code produces a sequence that does not match. Wrapping the change keeps both
+      populations correct under one deployed binary.
+
+      {[
+        if patched ctx "fraud-check-before-charge" then
+          execute_activity ctx fraud_check customer
+      ]}
+
+      Retiring a patch takes two further deployments. Once every execution that
+      predates the patch has closed, replace the check with {!deprecate_patch} and
+      delete the old branch; once the executions carrying the marker have closed,
+      delete the call. Removing the check in one step instead fails every execution
+      whose history holds the marker. *)
+
+  val deprecate_patch : _ ctx -> string -> unit
+  (** [deprecate_patch ctx patch_id] records that the unpatched branch is gone and
+      every future deployment carries only the patched code. It is the step between
+      {!patched} and deleting the call, and it is what keeps an execution whose
+      history holds the marker running once the body stops asking about it. *)
+
   val on_signal : _ ctx -> 'a Signal.t -> ('a -> unit) -> unit
   (** [on_signal ctx signal handler] runs [handler] whenever [signal] is
       received. The handler runs synchronously and typically mutates state the

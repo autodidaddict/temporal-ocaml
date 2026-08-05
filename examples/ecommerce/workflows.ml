@@ -181,3 +181,81 @@ let race_workflow =
   let t2 = start_timer ctx 3600.0 in
   ignore (await_any ctx [ t1; t2 ]);
   label ^ ":raced"
+
+(* Patching (ADR-0005): one workflow type in the four states its code passes through
+   when a change lands on a workflow that has executions in flight. main.ml registers
+   exactly one of these, chosen by PATCH_DEMO, so restarting the worker on a different
+   one against the same task queue is a deployment. scripts/livetest.sh drives all
+   four.
+
+   The change being made is the [sleep]: an operation inserted before an existing one,
+   which is the edit that breaks a running execution when made directly. *)
+let proceed = Signal.define ~name:"proceed" Codec.unit
+
+let wait_for_proceed ctx =
+  let go = ref false in
+  on_signal ctx proceed (fun () -> go := true);
+  wait_condition ctx (fun () -> !go)
+
+(* Step 0, the code before the change. *)
+let patch_demo_before =
+  Workflow.define ~name:"PatchDemoWorkflow" ~input:Codec.unit ~output:Codec.string
+  @@ fun ctx () ->
+  wait_for_proceed ctx;
+  "original"
+
+(* Step 1, the change behind a check. Executions started before this deployment keep
+   taking the original branch for the rest of their lives; executions started after it
+   take the new one. Both run here. *)
+let patch_demo_patched =
+  Workflow.define ~name:"PatchDemoWorkflow" ~input:Codec.unit ~output:Codec.string
+  @@ fun ctx () ->
+  let branch =
+    if patched ctx "settle-before-proceed" then (
+      sleep ctx 1.0;
+      "patched")
+    else "original"
+  in
+  wait_for_proceed ctx;
+  branch
+
+(* Step 3, once every execution that predates the patch has closed. The original
+   branch is gone and the check becomes its retirement form, which is what keeps an
+   execution whose history holds the marker running now that the body no longer asks
+   about it. *)
+let patch_demo_deprecated =
+  Workflow.define ~name:"PatchDemoWorkflow" ~input:Codec.unit ~output:Codec.string
+  @@ fun ctx () ->
+  deprecate_patch ctx "settle-before-proceed";
+  sleep ctx 1.0;
+  wait_for_proceed ctx;
+  "patched"
+
+(* Step 4, once the executions carrying the marker have closed too. Deploying this
+   while any of them is still open is the mistake the lifecycle exists to prevent:
+   their history holds a marker the body no longer accounts for, and sdk-core reports
+   a workflow that does not support that version. livetest.sh checks that it does. *)
+let patch_demo_retired =
+  Workflow.define ~name:"PatchDemoWorkflow" ~input:Codec.unit ~output:Codec.string
+  @@ fun ctx () ->
+  sleep ctx 1.0;
+  wait_for_proceed ctx;
+  "patched"
+
+(* Patch markers live in a run's history, and continue-as-new starts a run with an
+   empty one, so an execution that answered one way before the boundary can answer the
+   other way after it. Two versions again, before and after the change, registered by
+   the same PATCH_DEMO switch. livetest.sh starts this under the pre-patch version and
+   lets it continue-as-new under the patched one. *)
+let patch_continue_before =
+  Workflow.define ~name:"PatchContinueWorkflow" ~input:Codec.int ~output:Codec.string
+  @@ fun ctx (n : int) ->
+  wait_for_proceed ctx;
+  if n > 0 then continue_as_new ctx (n - 1) else "original"
+
+let patch_continue_patched =
+  Workflow.define ~name:"PatchContinueWorkflow" ~input:Codec.int ~output:Codec.string
+  @@ fun ctx (n : int) ->
+  let branch = if patched ctx "continue-change" then "patched" else "original" in
+  wait_for_proceed ctx;
+  if n > 0 then continue_as_new ctx (n - 1) else branch

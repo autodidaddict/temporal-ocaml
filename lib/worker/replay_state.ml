@@ -59,6 +59,14 @@ type run_state = {
     (* emit-once: keys ("act:seq" / "timer:seq" / "child:seq") of commands already
        sent, so a re-run does not re-issue an outstanding operation. Rebuilt empty on
        eviction, so a post-eviction full replay re-emits every command. *)
+  patches : (string, bool) Hashtbl.t;
+    (* the answer [patched] gave for each patch id in this run (ADR-0005). A
+       NotifyHasPatch job writes true; the first evaluation of an id the job did not
+       cover writes what is_replaying decided. The body re-runs from the top on every
+       activation, so without this an execution that answered false while replaying
+       would answer true on the next activation carrying new work, and change branches
+       halfway through its life. Rebuilt empty on eviction, and the full replay that
+       follows re-derives it from the same jobs in the same order. *)
 }
 
 let runs : (string, run_state) Hashtbl.t = Hashtbl.create 16
@@ -69,7 +77,7 @@ let get_run run_id =
   | None ->
     let s =
       { wf_name = ""; wf_id = ""; init_arg = None; events_rev = [];
-        issued = Hashtbl.create 16 }
+        issued = Hashtbl.create 16; patches = Hashtbl.create 4 }
     in
     Hashtbl.replace runs run_id s;
     s
@@ -133,4 +141,9 @@ let apply_job (state : run_state) = function
       Update { protocol_instance_id; name; input = p } :: state.events_rev
   | Coresdk.Cancel_workflow { reason } ->
     state.events_rev <- Cancel_root reason :: state.events_rev
+  | Coresdk.Notify_has_patch { patch_id } ->
+    (* sdk-core saw this patch's marker in history, so [patched] answers true. Sent
+       before the body asks. The job carries no ordering significance, unlike a
+       signal, so it does not join the event log. *)
+    Hashtbl.replace state.patches patch_id true
   | Coresdk.Remove_from_cache | Coresdk.Other -> ()

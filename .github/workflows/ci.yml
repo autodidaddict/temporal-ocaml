@@ -37,3 +37,11 @@ jobs:
       # see lib/dune), so there's no separate staging step.
       - name: Build
         run: opam exec -- dune build examples/ecommerce/main.exe
+
+      # The replay tests drive the engine directly, with no FFI call and no server,
+      # so they need nothing beyond the build above. They are where the determinism
+      # guarantees are pinned, so a green build without them means little.
+      # scripts/livetest.sh is not run here: it needs the temporal CLI and a dev
+      # server, which is a larger addition than this job currently carries.
+      - name: Test
+        run: opam exec -- dune test
