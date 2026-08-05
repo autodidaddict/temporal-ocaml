@@ -1288,6 +1288,163 @@ let () =
        Codec.of_payload Codec.string p = "new"
      | _ -> false)
 
+(* ---- patching: the sticky answer (ADR-0005 phase 3) ---------------------- *)
+
+(* A body that decides its branch, then parks until a signal, so the answer can be
+   observed across more than one activation. This is the shape the whole design exists
+   for: the body re-runs from the top on the second activation, and a patch check that
+   re-derived its answer from is_replaying alone would flip. *)
+let sticky_wf =
+  Workflow.reg
+    (Workflow.define ~name:"StickyPatchW" ~input:Codec.unit ~output:Codec.string
+       (fun ctx () ->
+         let branch = if Workflow.patched ctx "fraud-check" then "new" else "old" in
+         let go = ref false in
+         Workflow.on_signal ctx approve (fun () -> go := true);
+         Workflow.wait_condition ctx (fun () -> !go);
+         branch))
+
+let start_sticky run_id =
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"StickyPatchW" ~workflow_id:run_id [ unit_arg ]);
+  st
+
+let signal_approve st =
+  Replay_state.apply_job st
+    (Coresdk.Signal_workflow { signal_name = "approve"; input = [ unit_arg ] })
+
+let no_marker = List.for_all (function Coresdk.Set_patch_marker _ -> false | _ -> true)
+
+let () =
+  (* An execution that predates the patch. Its replay answers false, and the
+     activation after it carries new work with is_replaying = false. Answering from
+     is_replaying alone would take the new branch here, changing branches halfway
+     through the execution's life. *)
+  let run_id = "wf-patch-sticky-false" in
+  let st = start_sticky run_id in
+  let c1 = activation ~is_replaying:true sticky_wf st ~run_id ~history_length:1 in
+  check "sticky: the replaying pass parks with no marker" (c1 = []);
+  signal_approve st;
+  let c2 = activation ~is_replaying:false sticky_wf st ~run_id ~history_length:2 in
+  check "sticky: new work after a replay keeps the original branch"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "old"
+     | _ -> false);
+  check "sticky: the original branch never records a marker" (no_marker c2)
+
+let () =
+  (* An execution started after the patch. It records the marker on its first pass and
+     records it again on the activation that completes it, because sdk-core treats a
+     marker in history with no matching command as a workflow that does not support
+     that version. Core drops the duplicate. *)
+  let run_id = "wf-patch-sticky-true" in
+  let st = start_sticky run_id in
+  let c1 = activation ~is_replaying:false sticky_wf st ~run_id ~history_length:1 in
+  check "sticky: the first pass records the marker and parks"
+    (c1 = [ Coresdk.Set_patch_marker { patch_id = "fraud-check"; deprecated = false } ]);
+  signal_approve st;
+  let c2 = activation ~is_replaying:false sticky_wf st ~run_id ~history_length:2 in
+  check "sticky: a later re-run records the marker again and keeps the new branch"
+    (match c2 with
+     | [ Coresdk.Set_patch_marker { patch_id = "fraud-check"; deprecated = false };
+         Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "new"
+     | _ -> false)
+
+let () =
+  (* A signal that is nothing to do with the patch still re-runs the body. The answer
+     has to survive that too. *)
+  let run_id = "wf-patch-unrelated-signal" in
+  let st = start_sticky run_id in
+  let _ = activation ~is_replaying:true sticky_wf st ~run_id ~history_length:1 in
+  Replay_state.apply_job st
+    (Coresdk.Signal_workflow { signal_name = "unrelated"; input = [ unit_arg ] });
+  let c = activation ~is_replaying:false sticky_wf st ~run_id ~history_length:2 in
+  check "sticky: an unrelated signal does not flip the answer" (c = [] && no_marker c)
+
+let () =
+  (* Eviction drops the run's table. The full replay that follows re-derives the same
+     answer from the same jobs, which is what makes holding the answer in run_state
+     safe. *)
+  let run_id = "wf-patch-evicted" in
+  let st = start_sticky run_id in
+  let _ = activation ~is_replaying:true sticky_wf st ~run_id ~history_length:1 in
+  Replay_state.forget run_id;
+  let st = start_sticky run_id in
+  let c1 = activation ~is_replaying:true sticky_wf st ~run_id ~history_length:1 in
+  check "eviction: the rebuilt replay still records no marker" (c1 = [] && no_marker c1);
+  signal_approve st;
+  let c2 = activation ~is_replaying:false sticky_wf st ~run_id ~history_length:2 in
+  check "eviction: the rebuilt run still keeps the original branch"
+    (match c2 with
+     | [ Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "old"
+     | _ -> false)
+
+let () =
+  (* Answering a query must not add to an execution's history, so a query replay of a
+     patched body records nothing while still answering from the branch it took. *)
+  let query_wf =
+    Workflow.reg
+      (Workflow.define ~name:"PatchQueryW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           let branch = if Workflow.patched ctx "fraud-check" then "new" else "old" in
+           let go = ref false in
+           Workflow.on_signal ctx approve (fun () -> go := true);
+           Workflow.on_query ctx status_q (fun () -> branch);
+           Workflow.wait_condition ctx (fun () -> !go);
+           branch))
+  in
+  let run_id = "wf-patch-query" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"PatchQueryW" ~workflow_id:run_id [ unit_arg ]);
+  let _ = activation ~is_replaying:false query_wf st ~run_id ~history_length:1 in
+  let c =
+    Replay.run_workflow query_wf st ~task_queue:"test-tq" ~run_id ~can_suggested:false
+      ~history_length:1 ~is_replaying:false ~query_mode:true
+      ~queries:[ ("q1", "status", []) ] ~updates:[]
+  in
+  check "query mode: answers from the patched branch and records no marker"
+    (no_marker c
+    &&
+    match c with
+    | [ Coresdk.Respond_to_query { query_id = "q1"; result = Coresdk.Query_succeeded p } ]
+      -> Codec.of_payload Codec.string p = "new"
+    | _ -> false)
+
+let () =
+  (* The retirement form on a body that parks: allowed against a history that holds a
+     marker and against one that does not, and recorded on each run either way. *)
+  let dep_wf =
+    Workflow.reg
+      (Workflow.define ~name:"DepStickyW" ~input:Codec.unit ~output:Codec.string
+         (fun ctx () ->
+           Workflow.deprecate_patch ctx "fraud-check";
+           let go = ref false in
+           Workflow.on_signal ctx approve (fun () -> go := true);
+           Workflow.wait_condition ctx (fun () -> !go);
+           "new"))
+  in
+  let run_id = "wf-patch-deprecated-sticky" in
+  let st = Replay_state.get_run run_id in
+  Replay_state.apply_job st
+    (init_job ~workflow_type:"DepStickyW" ~workflow_id:run_id [ unit_arg ]);
+  Replay_state.apply_job st (Coresdk.Notify_has_patch { patch_id = "fraud-check" });
+  let c1 = activation ~is_replaying:true dep_wf st ~run_id ~history_length:1 in
+  check "deprecate_patch: recorded against a history that holds the marker"
+    (c1 = [ Coresdk.Set_patch_marker { patch_id = "fraud-check"; deprecated = true } ]);
+  signal_approve st;
+  let c2 = activation ~is_replaying:false dep_wf st ~run_id ~history_length:2 in
+  check "deprecate_patch: recorded again on the activation that completes the run"
+    (match c2 with
+     | [ Coresdk.Set_patch_marker { patch_id = "fraud-check"; deprecated = true };
+         Coresdk.Complete_workflow_execution (Some p) ] ->
+       Codec.of_payload Codec.string p = "new"
+     | _ -> false)
+
 let () =
   if !failures > 0 then (
     Printf.printf "%d replay test(s) failed\n" !failures;

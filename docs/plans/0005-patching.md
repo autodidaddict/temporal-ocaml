@@ -108,21 +108,30 @@ Landed.
 
 ### Phase 3 - Replay tests for the sticky answer
 
-The behavior that fails silently, so it gets its own phase rather than riding along
-with Phase 2.
+Landed. The behavior that fails silently, so it got its own phase rather than riding
+along with phase 2.
 
-- An execution that replays with no marker answers `false`, and then answers `false`
-  again on a following activation carrying new work with `is_replaying = false`. This is
-  the case the whole design exists for.
-- An execution whose activation carries `NotifyHasPatch` answers `true` on that
-  activation and on every re-run after it.
-- A first pass with no marker and no replay emits exactly one `SetPatchMarker` and
-  answers `true`, and a re-run triggered by an unrelated signal emits none.
-- Eviction drops the table, and the full replay that follows re-derives the same
-  answers in the same order.
-- A query-mode replay of a patched body emits no marker and still answers consistently.
-- `deprecate_patch` emits the marker with `deprecated` set and is accepted in every one
-  of the above histories.
+The tests drive a body that decides its branch and then parks on a signal, so the
+answer can be observed across more than one activation.
+
+- An execution that replays with no marker answers `false` and answers `false` again on
+  the following activation carrying new work. This is the case the whole design exists
+  for.
+- The same holds when the re-run is triggered by a signal that has nothing to do with
+  the patch.
+- An execution whose activation carries `NotifyHasPatch` answers `true` even while
+  replaying.
+- A first pass records the marker, and the activation that completes the run records it
+  again. This corrects what this plan first said, which was that a later re-run emits
+  none. Emitting again is required, not tolerated: see the phase 2 notes.
+- Eviction drops the table, and the full replay that follows re-derives the same answer.
+- A query-mode replay of a patched body answers from the branch it took and records no
+  marker.
+- `deprecate_patch` is recorded against a history that holds a marker and against one
+  that does not.
+- The suite was checked against a mutation rather than assumed to bite. Replacing the
+  recorded answer with a bare `not is_replaying` fails five of these, including both
+  cases the design exists for.
 
 ### Phase 4 - Integration and finalize
 
